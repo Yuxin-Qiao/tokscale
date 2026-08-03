@@ -259,6 +259,18 @@ export interface HighwaterAggregateRow {
   cost: string;
 }
 
+/**
+ * Both derivations, read in ONE statement so they share a snapshot.
+ *
+ * `snapshotTokens`/`snapshotCost` are `SUM(daily_breakdown)` re-read at census
+ * time — NOT the value served to the caller. See `readDualDerivation` for why
+ * the difference matters.
+ */
+export interface DualDerivationRow extends HighwaterAggregateRow {
+  snapshotTokens: number;
+  snapshotCost: string;
+}
+
 export function interpretHighwaterAggregate(
   row: HighwaterAggregateRow | undefined | null
 ): HighwaterTotalReading {
@@ -322,6 +334,65 @@ export async function readHighwaterTotal(params: {
 }
 
 /**
+ * Read BOTH derivations in a single statement.
+ *
+ * Why this is not just `readHighwaterTotal` plus the value from the response:
+ * the submit transaction takes `.for('update')` on the submissions row, so two
+ * devices belonging to one user serialize only UNTIL COMMIT. The census runs
+ * after that, unsynchronized. So request A can hold a served total captured at
+ * its own commit while request B commits and raises the high-water rows, and
+ * A's later high-water read then sees B's contribution. Pairing those two
+ * numbers reports a divergence that neither derivation actually had — and the
+ * skew goes the wrong way, understating the served side, so it can log a
+ * NEGATIVE delta while both derivations agreed at every commit.
+ *
+ * That noise lands specifically on users submitting from multiple devices,
+ * which is exactly the population the census exists to characterize, so it is
+ * not tolerable in the data meant to gate the Phase 2 cutover.
+ *
+ * A single statement evaluates every subquery in one snapshot, so the two
+ * sides are consistent by construction. The value SERVED to the caller is
+ * still the one computed inside the transaction and is not touched here; it is
+ * recorded alongside so a concurrent submit is visible rather than silent.
+ */
+export async function readDualDerivation(params: {
+  executor: HighwaterQueryExecutor;
+  userId: string;
+  submissionId: string;
+  bucketWidth?: string;
+}): Promise<{ snapshotTokens: number; snapshotCost: number; highwater: HighwaterTotalReading }> {
+  const bucketWidth = params.bucketWidth ?? DEVICE_CLIENT_TOTALS_BUCKET_WIDTH;
+  const result = await params.executor.execute(sql`
+    SELECT
+      (
+        SELECT LEAST(COALESCE(SUM(db.tokens), 0), ${sql.raw(BIGINT_MAX)})::bigint
+        FROM daily_breakdown AS db
+        WHERE db.submission_id = ${params.submissionId}::uuid
+      ) AS "snapshotTokens",
+      (
+        SELECT COALESCE(SUM(CAST(db.cost AS DECIMAL(14,4))), 0)::text
+        FROM daily_breakdown AS db
+        WHERE db.submission_id = ${params.submissionId}::uuid
+      ) AS "snapshotCost",
+      COUNT(*)::int AS "bucketCount",
+      LEAST(COALESCE(SUM(t.tokens_highwater), 0), ${sql.raw(BIGINT_MAX)})::bigint AS "tokens",
+      COALESCE(SUM(t.cost_highwater), 0)::text AS "cost"
+    FROM submitted_device_client_totals AS t
+    JOIN submitted_devices AS d ON d.id = t.submitted_device_id
+    WHERE d.user_id = ${params.userId}::uuid
+      AND t.bucket_width = ${bucketWidth}
+  `);
+
+  const row = firstRow(result) as DualDerivationRow | undefined;
+  const snapshotCost = Number.parseFloat(row?.snapshotCost ?? "0");
+  return {
+    snapshotTokens: Number(row?.snapshotTokens ?? 0),
+    snapshotCost: Number.isFinite(snapshotCost) ? snapshotCost : 0,
+    highwater: interpretHighwaterAggregate(row),
+  };
+}
+
+/**
  * The Phase 1.5 record: the pair of derivations, and the delta between them.
  *
  * The SERVED value is `servedTokens`/`servedCost` — `SUM(daily_breakdown)`,
@@ -331,15 +402,30 @@ export interface DualDerivationRecord {
   userId: string;
   submissionId: string;
   bucketWidth: string;
+  /**
+   * What the HTTP response actually carried, computed inside the transaction.
+   * Recorded as evidence that the served value is unchanged — never used to
+   * compute the delta, because it comes from a different snapshot than the
+   * high-water read (see `readDualDerivation`).
+   */
   servedTokens: number;
   servedCost: number;
+  /** `SUM(daily_breakdown)` from the SAME snapshot as the high-water read. */
+  snapshotTokens: number;
+  snapshotCost: number;
+  /**
+   * True when a concurrent submit for this user landed between this request's
+   * commit and its census read. Not an error — it is why the delta is computed
+   * from `snapshotTokens` rather than `servedTokens`.
+   */
+  racedConcurrentSubmit: boolean;
   highwaterStatus: HighwaterTotalReading["status"];
   highwaterTokens: number | null;
   highwaterCost: number | null;
   bucketCount: number | null;
-  /** servedTokens - highwaterTokens; null while the reading is unknown. */
+  /** snapshotTokens - highwaterTokens; null while the reading is unknown. */
   tokenDelta: number | null;
-  /** servedTokens / highwaterTokens; null while unknown or divide-by-zero. */
+  /** snapshotTokens / highwaterTokens; null while unknown or divide-by-zero. */
   tokenRatio: number | null;
 }
 
@@ -349,6 +435,8 @@ export function buildDualDerivationRecord(params: {
   bucketWidth?: string;
   servedTokens: number;
   servedCost: number;
+  snapshotTokens: number;
+  snapshotCost: number;
   highwater: HighwaterTotalReading;
 }): DualDerivationRecord {
   const { highwater } = params;
@@ -358,6 +446,9 @@ export function buildDualDerivationRecord(params: {
     bucketWidth: params.bucketWidth ?? DEVICE_CLIENT_TOTALS_BUCKET_WIDTH,
     servedTokens: params.servedTokens,
     servedCost: params.servedCost,
+    snapshotTokens: params.snapshotTokens,
+    snapshotCost: params.snapshotCost,
+    racedConcurrentSubmit: params.snapshotTokens !== params.servedTokens,
   };
 
   if (highwater.status === "unknown") {
@@ -378,9 +469,11 @@ export function buildDualDerivationRecord(params: {
     highwaterTokens: highwater.tokens,
     highwaterCost: highwater.cost,
     bucketCount: highwater.bucketCount,
-    tokenDelta: params.servedTokens - highwater.tokens,
+    // Both operands come from one snapshot, so this cannot report a divergence
+    // that neither derivation had.
+    tokenDelta: params.snapshotTokens - highwater.tokens,
     tokenRatio:
-      highwater.tokens > 0 ? params.servedTokens / highwater.tokens : null,
+      highwater.tokens > 0 ? params.snapshotTokens / highwater.tokens : null,
   };
 }
 

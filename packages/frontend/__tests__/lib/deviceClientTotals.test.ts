@@ -12,6 +12,7 @@ import {
   interpretHighwaterAggregate,
   isDeviceClientTotalsWriteEnabled,
   monthBucketKey,
+  readDualDerivation,
   readHighwaterTotal,
   recordDeviceClientTotals,
   type DeviceClientTotalsContribution,
@@ -382,6 +383,46 @@ describe("a missing bucket reads as UNKNOWN, never as zero", () => {
   });
 });
 
+describe("readDualDerivation reads both sides from ONE snapshot", () => {
+  // The submit transaction serializes a user's devices only until commit; the
+  // census runs after that, unsynchronized. Two separate reads therefore let
+  // request A pair its own pre-commit served total with a high-water total
+  // that already includes request B — a divergence neither derivation had.
+  it("issues a single statement covering both derivations", async () => {
+    const executor = capturingExecutor();
+    await readDualDerivation({
+      executor,
+      userId: "11111111-1111-4111-8111-111111111111",
+      submissionId: "22222222-2222-4222-8222-222222222222",
+    });
+
+    expect(executor.queries).toHaveLength(1);
+    const [query] = executor.queries;
+    expect(query.sql).toContain("submitted_device_client_totals");
+    expect(query.sql).toContain("daily_breakdown");
+    expect(query.sql).toContain('AS "snapshotTokens"');
+    expect(query.sql).toContain('AS "tokens"');
+  });
+
+  it("clamps the daily-side SUM too, so the census cannot abort on a cast", async () => {
+    const executor = capturingExecutor();
+    await readDualDerivation({ executor, userId: "u", submissionId: "s" });
+    const clamps = executor.queries[0].sql.match(/LEAST\(COALESCE\(SUM\(/g) ?? [];
+    expect(clamps).toHaveLength(2);
+  });
+
+  it("still reports unknown coverage while returning a served snapshot", async () => {
+    const executor = {
+      execute: async () => [
+        { snapshotTokens: 1200, snapshotCost: "3.0000", bucketCount: 0, tokens: 0, cost: "0" },
+      ],
+    };
+    const result = await readDualDerivation({ executor, userId: "u", submissionId: "s" });
+    expect(result.snapshotTokens).toBe(1200);
+    expect(result.highwater).toEqual({ status: "unknown" });
+  });
+});
+
 describe("buildDualDerivationRecord (Phase 1.5)", () => {
   it("records both derivations and their delta once coverage exists", () => {
     const record = buildDualDerivationRecord({
@@ -389,17 +430,44 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       submissionId: "s1",
       servedTokens: 1200,
       servedCost: 3,
+      snapshotTokens: 1200,
+      snapshotCost: 3,
       highwater: { status: "known", tokens: 1000, cost: 2.5, bucketCount: 4 },
     });
 
     expect(record).toMatchObject({
       servedTokens: 1200,
+      snapshotTokens: 1200,
       highwaterTokens: 1000,
       tokenDelta: 200,
       tokenRatio: 1.2,
       bucketCount: 4,
       highwaterStatus: "known",
+      racedConcurrentSubmit: false,
     });
+  });
+
+  it("computes the delta from the SNAPSHOT pair, never the stale served total", () => {
+    // A second device of the same user committed between this request's own
+    // commit and its census read, so SUM(daily) has moved on. Pairing the
+    // stale served total (1200) with the fresh high-water total (1500) would
+    // log a spurious -300; both census operands must come from one snapshot.
+    const record = buildDualDerivationRecord({
+      userId: "u1",
+      submissionId: "s1",
+      servedTokens: 1200,
+      servedCost: 3,
+      snapshotTokens: 1500,
+      snapshotCost: 4,
+      highwater: { status: "known", tokens: 1500, cost: 4, bucketCount: 6 },
+    });
+
+    expect(record.tokenDelta).toBe(0);
+    expect(record.tokenRatio).toBe(1);
+    // The race is recorded rather than hidden...
+    expect(record.racedConcurrentSubmit).toBe(true);
+    // ...and the value actually served is still reported unchanged.
+    expect(record.servedTokens).toBe(1200);
   });
 
   it("emits a null delta, not the served total, while coverage is unknown", () => {
@@ -408,6 +476,8 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       submissionId: "s1",
       servedTokens: 1200,
       servedCost: 3,
+      snapshotTokens: 1200,
+      snapshotCost: 3,
       highwater: { status: "unknown" },
     });
 
@@ -425,6 +495,8 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       submissionId: "s1",
       servedTokens: 500,
       servedCost: 1,
+      snapshotTokens: 500,
+      snapshotCost: 1,
       highwater: { status: "known", tokens: 0, cost: 0, bucketCount: 2 },
     });
     expect(record.tokenRatio).toBeNull();

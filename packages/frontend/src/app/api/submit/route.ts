@@ -21,7 +21,7 @@ import {
   buildDualDerivationRecord,
   foldContributionsIntoBuckets,
   isDeviceClientTotalsWriteEnabled,
-  readHighwaterTotal,
+  readDualDerivation,
   recordDeviceClientTotals,
   DUAL_DERIVATION_LOG_PREFIX,
 } from "@/lib/db/deviceClientTotals";
@@ -259,14 +259,24 @@ async function recordRatchetCensus(params: {
       buckets,
     });
 
-    // Phase 1.5: derive the total the OTHER way and record the pair. The value
-    // already served came from SUM(daily_breakdown.tokens) and is untouched.
-    const highwater = await readHighwaterTotal({ executor: db, userId: params.userId });
+    // Phase 1.5: derive the total the OTHER way and record the pair. Both
+    // derivations are read in ONE statement so they share a snapshot — pairing
+    // this request's in-transaction total with a later high-water read would
+    // report a divergence neither derivation had whenever a second device of
+    // the same user commits in between. The value already SERVED is untouched
+    // either way; it is recorded alongside as evidence of that.
+    const { snapshotTokens, snapshotCost, highwater } = await readDualDerivation({
+      executor: db,
+      userId: params.userId,
+      submissionId: params.submissionId,
+    });
     const record = buildDualDerivationRecord({
       userId: params.userId,
       submissionId: params.submissionId,
       servedTokens: params.servedTokens,
       servedCost: params.servedCost,
+      snapshotTokens,
+      snapshotCost,
       highwater,
     });
     console.log(`${DUAL_DERIVATION_LOG_PREFIX} ${JSON.stringify(record)}`);

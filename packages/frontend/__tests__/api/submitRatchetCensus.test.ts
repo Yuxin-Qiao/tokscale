@@ -339,7 +339,9 @@ describe("POST /api/submit ratchet census placement (phase 1 / 1.5)", () => {
     let committedWhenCensusRan: boolean | null = null;
     mockState.db.execute.mockImplementation(async () => {
       if (committedWhenCensusRan === null) committedWhenCensusRan = trace.committed();
-      return [{ bucketCount: 1, tokens: 12, cost: "0.5000" }];
+      return [
+        { snapshotTokens: 12, snapshotCost: "0.5000", bucketCount: 1, tokens: 12, cost: "0.5000" },
+      ];
     });
 
     const response = await POST(submitRequest());
@@ -379,7 +381,7 @@ describe("POST /api/submit ratchet census placement (phase 1 / 1.5)", () => {
     buildMockTx();
     const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
     mockState.db.execute.mockResolvedValue([
-      { bucketCount: 1, tokens: 3, cost: "0.1000" },
+      { snapshotTokens: 12, snapshotCost: "0.5000", bucketCount: 1, tokens: 3, cost: "0.1000" },
     ]);
 
     const response = await POST(submitRequest());
@@ -403,7 +405,9 @@ describe("POST /api/submit ratchet census placement (phase 1 / 1.5)", () => {
     primeMocks();
     buildMockTx();
     const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
-    mockState.db.execute.mockResolvedValue([{ bucketCount: 0, tokens: 0, cost: "0" }]);
+    mockState.db.execute.mockResolvedValue([
+      { snapshotTokens: 12, snapshotCost: "0.5000", bucketCount: 0, tokens: 0, cost: "0" },
+    ]);
 
     await POST(submitRequest());
 
