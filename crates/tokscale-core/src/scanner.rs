@@ -58,6 +58,26 @@ pub struct ScannerSettings {
     /// so the JSON stays stable and human-editable.
     #[serde(default)]
     pub extra_scan_paths: BTreeMap<String, Vec<PathBuf>>,
+    /// IANA name of the timezone this device buckets usage days into, e.g.
+    /// `"Asia/Seoul"`.
+    ///
+    /// Which local calendar day a message lands in used to be read from
+    /// `chrono::Local` on every scan, so rescanning the same history from a
+    /// different zone re-split it across days. The server's monotonic per-day
+    /// guard then kept the stale value on one day and accepted the new one on
+    /// its neighbour, inflating the total permanently. Recording the zone once
+    /// makes the bucket key stable.
+    ///
+    /// `None` means the device has never pinned, and day keys keep following
+    /// `chrono::Local` exactly as before — pinning changes nothing until it
+    /// happens. The CLI fills this in on first run (see
+    /// `tui::settings::pin_bucket_timezone_if_unset`); `tokscale config set
+    /// timezone <zone>` changes it deliberately, which is what a user who
+    /// relocates should do.
+    ///
+    /// An unparseable value degrades to unpinned rather than failing the scan.
+    #[serde(default)]
+    pub bucket_timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -360,6 +360,11 @@ enum Commands {
     },
     #[command(about = "Warm TUI cache in background (internal)", hide = true)]
     WarmTuiCache,
+    #[command(about = "Read and write persistent tokscale settings")]
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigSubcommand,
+    },
     #[command(about = "Task-attributed usage report")]
     Report {
         #[arg(long, help = "Output as JSON")]
@@ -382,6 +387,41 @@ enum Commands {
         rebuild: bool,
         #[arg(long, help = "Show all sessions without truncation")]
         full: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigSubcommand {
+    #[command(about = "Show all settings tokscale config can change")]
+    List,
+    #[command(about = "Print one setting's value")]
+    Get {
+        #[arg(help = "Setting name (timezone)")]
+        key: String,
+    },
+    #[command(
+        about = "Change one setting",
+        long_about = "Change one setting.\n\n\
+                      timezone: the IANA zone this device buckets usage days into, e.g. \
+                      Asia/Seoul. Pinned automatically on first run; set it explicitly \
+                      after relocating so day boundaries move deliberately instead of on \
+                      the next rescan. Pass `auto` to re-detect from this machine."
+    )]
+    Set {
+        #[arg(help = "Setting name (timezone)")]
+        key: String,
+        #[arg(help = "New value; `auto` re-detects for timezone")]
+        value: String,
+    },
+    #[command(
+        about = "Clear one setting",
+        long_about = "Clear one setting.\n\n\
+                      Clearing timezone makes the next run re-pin this machine's current \
+                      zone; it does not turn pinning off."
+    )]
+    Unset {
+        #[arg(help = "Setting name (timezone)")]
+        key: String,
     },
 }
 
@@ -537,6 +577,14 @@ fn main() -> Result<()> {
     // path runs, so model-name variants fold consistently across every command.
     // Honors the global `--home` override exactly like scanner settings; an
     // empty or absent config is a strict no-op.
+    // Record this device's bucketing timezone before anything reads scanner
+    // settings. Day keys used to be re-derived from `chrono::Local` on every
+    // scan, so the same history re-split across days whenever the machine's
+    // zone changed; the server's monotonic per-day guard then kept the stale
+    // value on one day and the new one on its neighbour, inflating the total
+    // for good. Pinning on first run is what stops that from recurring — see
+    // `pin_bucket_timezone_if_unset` for what it deliberately does not do.
+    tui::settings::pin_bucket_timezone_if_unset(&cli.home);
     tokscale_core::model_alias::set_global(&tui::settings::load_model_aliases_for_home(&cli.home));
     let opencode_model_names = tokscale_core::opencode_model_name::load_for_home(
         cli.home.as_deref().map(std::path::Path::new),
@@ -852,6 +900,18 @@ fn main() -> Result<()> {
             )
         }
         Some(Commands::WarmTuiCache) => run_warm_tui_cache(),
+        Some(Commands::Config { subcommand }) => {
+            // Writes to this machine's config path, which `--home` does not
+            // move; honoring the flag here would read one file and write
+            // another.
+            reject_unsupported_home_override(&cli.home, "config")?;
+            match subcommand {
+                ConfigSubcommand::List => commands::config::run_list(),
+                ConfigSubcommand::Get { key } => commands::config::run_get(&key),
+                ConfigSubcommand::Set { key, value } => commands::config::run_set(&key, &value),
+                ConfigSubcommand::Unset { key } => commands::config::run_unset(&key),
+            }
+        }
         Some(Commands::Report {
             json,
             workspace,
@@ -1612,7 +1672,20 @@ fn ensure_home_supported_for_tui(home_dir: &Option<String>) -> Result<()> {
 }
 
 fn build_date_filter(date: &DateRangeFlags) -> (Option<String>, Option<String>) {
-    build_date_filter_for_date(date, chrono::Local::now().date_naive())
+    build_date_filter_for_date(date, current_bucket_date())
+}
+
+/// Today, as the day keys this scan produces define it.
+///
+/// `--today` and friends compare against `date` strings, and once a bucketing
+/// timezone is pinned those strings stop tracking the host. Resolving "today"
+/// anywhere else would select the wrong day out of the right buckets.
+///
+/// Identical to `chrono::Local::now().date_naive()` when nothing is pinned,
+/// which is every device that has not upgraded yet.
+fn current_bucket_date() -> chrono::NaiveDate {
+    tokscale_core::BucketTimezone::from_scanner_settings(&tui::settings::load_scanner_settings())
+        .today()
 }
 
 fn build_date_filter_for_date(

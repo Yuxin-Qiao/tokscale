@@ -382,6 +382,25 @@ impl UnifiedMessage {
         self.date = timestamp_to_date(self.timestamp);
     }
 
+    /// Re-derive the day bucket under an explicitly chosen timezone.
+    ///
+    /// `UnifiedMessage::new` is a constructor called from 92 sites across 42
+    /// parser files, so the zone cannot be threaded into it without touching
+    /// every one. It does not need to be: `date` is a derived field, already
+    /// recomputed from `timestamp` after construction. This lets the one
+    /// post-parse pass that holds the user's settings re-key every message at
+    /// once, which is the only place the pinned zone is actually known.
+    pub(crate) fn rebucket_date(&mut self, timezone: &crate::bucket_tz::BucketTimezone) {
+        let key = timezone.day_key(self.timestamp);
+        // An unrepresentable instant yields an empty key. Keeping the previous
+        // date is wrong by at most the offset between two zones; replacing it
+        // with `""` would collapse the message into a bucket that is not a day
+        // at all, and that bucket would then be submitted.
+        if !key.is_empty() {
+            self.date = key;
+        }
+    }
+
     pub(crate) fn set_timestamp(&mut self, timestamp: i64) {
         self.timestamp = timestamp;
         self.refresh_derived_fields();
@@ -450,10 +469,7 @@ where
     Tz: chrono::TimeZone,
     Tz::Offset: std::fmt::Display,
 {
-    match timezone.timestamp_millis_opt(timestamp_ms) {
-        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d").to_string(),
-        _ => String::new(),
-    }
+    crate::bucket_tz::format_day_key(timestamp_ms, timezone)
 }
 
 #[cfg(test)]

@@ -245,6 +245,56 @@ pub fn load_scanner_settings_for_home(home_dir: &Option<String>) -> ScannerSetti
     Settings::load_for_home_override(home_dir.as_deref().map(Path::new)).scanner
 }
 
+/// Record this machine's IANA timezone as the device's bucketing zone, once.
+///
+/// Day keys used to be derived from `chrono::Local` on every scan, so moving
+/// machines or changing `TZ` re-split the same history across different days
+/// and the server's monotonic per-day guard turned that into permanent
+/// inflation. Pinning the zone removes the cause, but only for devices that
+/// actually have one pinned — so the CLI pins on first run rather than waiting
+/// for every user to discover a config command.
+///
+/// This is deliberately not a behaviour change on the machine that runs it: the
+/// zone written is the one `chrono::Local` would have resolved anyway, so the
+/// first scan after pinning reports exactly what it would have reported before.
+/// What changes is the *next* scan, from somewhere else.
+///
+/// Does nothing when:
+/// - a zone is already pinned — including one the user set by hand;
+/// - the platform cannot name its zone (`TZ=+09:00`, a container with no
+///   zoneinfo). A fixed offset cannot follow DST, so pinning one would swap this
+///   bug for a smaller version of itself. Staying unpinned is the honest state.
+/// - the caller passed `--home`, which points at another machine's data
+///   directory. This machine's zone is not that device's zone, and `save()`
+///   writes to *this* machine's config path regardless, so the two would not
+///   even agree on a file.
+///
+/// A failed save is ignored: the next run retries, and an unpinned device is
+/// exactly as correct as it was before this function existed.
+pub fn pin_bucket_timezone_if_unset(home_dir: &Option<String>) {
+    if home_dir.is_some() {
+        return;
+    }
+
+    let mut settings = Settings::load();
+    if settings.scanner.bucket_timezone.is_some() {
+        return;
+    }
+
+    let Some(zone) = tokscale_core::bucket_tz::detect_local_iana_name() else {
+        tracing::debug!(
+            "could not resolve an IANA timezone name for this machine — \
+             leaving scanner.bucketTimezone unset"
+        );
+        return;
+    };
+
+    settings.scanner.bucket_timezone = Some(zone);
+    if let Err(error) = settings.save() {
+        tracing::debug!(%error, "failed to persist scanner.bucketTimezone");
+    }
+}
+
 /// Loads the user's configured model aliases, honoring a `--home` override the
 /// same way [`load_scanner_settings_for_home`] does. A missing or malformed
 /// settings.json yields an empty map (no folding); this never errors.

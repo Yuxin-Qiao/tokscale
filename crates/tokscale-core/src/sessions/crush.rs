@@ -13,8 +13,8 @@
 
 use super::utils::open_readonly_sqlite;
 use super::UnifiedMessage;
+use crate::bucket_tz::BucketTimezone;
 use crate::TokenBreakdown;
-use chrono::{Local, TimeZone};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -45,6 +45,22 @@ struct DayBucket {
 /// - session cost is allocated across those days proportionally
 /// - token fields remain zero
 pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+    parse_crush_sqlite_in(db_path, &BucketTimezone::Local)
+}
+
+/// [`parse_crush_sqlite`], keyed by the scan's bucketing timezone.
+///
+/// Crush is the one parser whose day split cannot be repaired by the post-parse
+/// rebucket pass. It allocates a session's cost across the days its assistant
+/// messages fall in and emits one message per day, so the *number* of messages
+/// and the cost on each is decided here, at parse time. Rebucketing afterwards
+/// can only relabel messages that already exist: if this grouping put two
+/// midnight-straddling turns in one day, the day they were split across is gone
+/// before the pass runs.
+pub fn parse_crush_sqlite_in(
+    db_path: &Path,
+    bucket_timezone: &BucketTimezone,
+) -> Vec<UnifiedMessage> {
     let Some(conn) = open_readonly_sqlite(db_path) else {
         return Vec::new();
     };
@@ -54,7 +70,7 @@ pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         return Vec::new();
     }
 
-    let assistant_buckets = load_assistant_buckets(&conn);
+    let assistant_buckets = load_assistant_buckets(&conn, bucket_timezone);
     let db_namespace = db_path.to_string_lossy().to_string();
     let mut messages = Vec::new();
 
@@ -152,7 +168,10 @@ fn load_root_sessions(conn: &Connection) -> Vec<CrushSession> {
     rows.flatten().collect()
 }
 
-fn load_assistant_buckets(conn: &Connection) -> HashMap<String, Vec<DayBucket>> {
+fn load_assistant_buckets(
+    conn: &Connection,
+    bucket_timezone: &BucketTimezone,
+) -> HashMap<String, Vec<DayBucket>> {
     let query = r#"
         WITH RECURSIVE session_tree(root_session_id, session_id) AS (
             SELECT id, id
@@ -193,7 +212,7 @@ fn load_assistant_buckets(conn: &Connection) -> HashMap<String, Vec<DayBucket>> 
         let Some(timestamp_ms) = normalize_crush_timestamp_ms(created_at) else {
             continue;
         };
-        let Some(local_day) = local_day_key(timestamp_ms) else {
+        let Some(local_day) = local_day_key(timestamp_ms, bucket_timezone) else {
             continue;
         };
 
@@ -224,10 +243,12 @@ fn normalize_crush_timestamp_ms(raw: i64) -> Option<i64> {
     }
 }
 
-fn local_day_key(timestamp_ms: i64) -> Option<String> {
-    match Local.timestamp_millis_opt(timestamp_ms) {
-        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%d").to_string()),
-        _ => None,
+fn local_day_key(timestamp_ms: i64, bucket_timezone: &BucketTimezone) -> Option<String> {
+    let key = bucket_timezone.day_key(timestamp_ms);
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
     }
 }
 
@@ -315,6 +336,60 @@ mod tests {
             params![id, session_id, role, is_summary_message, created_at],
         )
         .unwrap();
+    }
+
+    /// Crush is the one parser whose day split is decided at parse time: it
+    /// allocates a session's cost across the days its assistant turns fall in
+    /// and emits one message per day. The post-parse rebucket pass can relabel
+    /// those messages but cannot recover a split this grouping collapsed, so
+    /// the pinned zone has to reach in here.
+    ///
+    /// Two turns 6.5 hours apart: one calendar day in Los Angeles, two in
+    /// Kiritimati. The cost split follows whichever zone is pinned.
+    #[test]
+    fn test_parse_crush_sqlite_splits_cost_by_the_pinned_timezone() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+
+        // 2026-03-02T11:30:00Z and 2026-03-02T18:00:00Z.
+        let first = 1_772_451_000_i64;
+        let second = 1_772_474_400_i64;
+
+        insert_root_session(&conn, "root-tz", 2, 10.0, second, first);
+        insert_message(&conn, "msg-1", "root-tz", "assistant", first, 0);
+        insert_message(&conn, "msg-2", "root-tz", "assistant", second, 0);
+
+        // Los Angeles: 03:30 and 10:00 on 2026-03-02 — one day, one message.
+        let los_angeles = parse_crush_sqlite_in(
+            &db_path,
+            &BucketTimezone::from_pinned_name(Some("America/Los_Angeles")),
+        );
+        assert_eq!(los_angeles.len(), 1);
+        assert_eq!(los_angeles[0].message_count, 2);
+        assert!((los_angeles[0].cost - 10.0).abs() < 1e-9);
+
+        // Kiritimati: 2026-03-03 01:30 and 08:00 — still one day, because both
+        // turns cross together. Seoul is where they separate: 20:30 on the 2nd
+        // and 03:00 on the 3rd.
+        let seoul =
+            parse_crush_sqlite_in(&db_path, &BucketTimezone::from_pinned_name(Some("Asia/Seoul")));
+        assert_eq!(seoul.len(), 2, "Seoul splits the session across two days");
+        assert_eq!(seoul[0].message_count, 1);
+        assert_eq!(seoul[1].message_count, 1);
+        assert!(
+            (seoul.iter().map(|m| m.cost).sum::<f64>() - 10.0).abs() < 1e-9,
+            "splitting must conserve the session cost"
+        );
+
+        // And the split is a function of the pin alone: the same call twice
+        // returns the same shape regardless of what the host machine is set to.
+        let seoul_again =
+            parse_crush_sqlite_in(&db_path, &BucketTimezone::from_pinned_name(Some("Asia/Seoul")));
+        assert_eq!(
+            seoul.iter().map(|m| m.timestamp).collect::<Vec<_>>(),
+            seoul_again.iter().map(|m| m.timestamp).collect::<Vec<_>>()
+        );
     }
 
     #[test]

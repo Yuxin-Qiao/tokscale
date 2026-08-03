@@ -3729,3 +3729,233 @@ fn report_no_summarize_json_empty_home_emits_valid_json_without_panic() {
         "expected zero entries for empty home, got: {entries:?}"
     );
 }
+
+/// A session whose two turns land on different calendar days depending on the
+/// zone reading them. Chosen so all three zones used below disagree:
+///
+/// | zone                  | 11:30Z     | 18:00Z     | day buckets              |
+/// |-----------------------|------------|------------|--------------------------|
+/// | `America/Los_Angeles` | 03-02 03:30| 03-02 10:00| `{03-02: 2}`             |
+/// | `Asia/Seoul`          | 03-02 20:30| 03-03 03:00| `{03-02: 1, 03-03: 1}`   |
+/// | `Pacific/Kiritimati`  | 03-03 01:30| 03-03 08:00| `{03-03: 2}`             |
+///
+/// Three distinct shapes means a test can tell which zone actually did the
+/// bucketing, rather than only that two runs happened to agree.
+fn create_bucket_timezone_fixture_dir() -> TempDir {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let base = tmp.path();
+    prime_pricing_cache(base);
+
+    let session = base.join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&session).unwrap();
+
+    for (id, created_ms) in [("msg_a", 1_772_451_000_000i64), ("msg_b", 1_772_474_400_000)] {
+        let msg = format!(
+            r#"{{
+                "id": "{id}",
+                "sessionID": "session1",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-20250514",
+                "providerID": "anthropic",
+                "cost": 0.05,
+                "tokens": {{
+                    "input": 1000,
+                    "output": 500,
+                    "reasoning": 0,
+                    "cache": {{ "read": 200, "write": 50 }}
+                }},
+                "time": {{ "created": {created_ms}.0 }}
+            }}"#
+        );
+        fs::write(session.join(format!("{id}.json")), msg).unwrap();
+    }
+
+    tmp
+}
+
+fn pin_bucket_timezone(base: &Path, zone: &str) {
+    let config_dir = base.join(".config/tokscale");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("settings.json"),
+        format!(r#"{{ "scanner": {{ "bucketTimezone": "{zone}" }} }}"#),
+    )
+    .unwrap();
+}
+
+/// Day buckets that actually carry messages, as `(date, message_count)`.
+/// The graph zero-fills a calendar, so the empty days carry no signal.
+fn graph_day_buckets(base: &Path, timezone: &str) -> Vec<(String, i64)> {
+    let output = cmd_with_home(base)
+        .env("TZ", timezone)
+        .args(["graph", "--client", "opencode", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut buckets: Vec<(String, i64)> = json["contributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| {
+            let messages = c["totals"]["messages"].as_i64().unwrap_or(0);
+            (messages > 0).then(|| (c["date"].as_str().unwrap().to_string(), messages))
+        })
+        .collect();
+    buckets.sort();
+    buckets
+}
+
+/// The regression this whole feature exists for.
+///
+/// Day keys used to be derived from `chrono::Local` on every scan, so
+/// rescanning the same unchanged history from another timezone re-split it
+/// across days. The server's monotonic per-day guard then kept the stale value
+/// on one day and accepted the new one on its neighbour, and the device's total
+/// was inflated permanently with no way to walk it back.
+///
+/// With a zone pinned, the same bytes produce the same day keys no matter what
+/// `TZ` says — and specifically the *pinned* zone's keys, not either host's.
+#[test]
+fn test_pinned_bucket_timezone_survives_a_host_timezone_change() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone(tmp.path(), "Pacific/Kiritimati");
+
+    let from_los_angeles = graph_day_buckets(tmp.path(), "America/Los_Angeles");
+    let from_seoul = graph_day_buckets(tmp.path(), "Asia/Seoul");
+
+    assert_eq!(
+        from_los_angeles, from_seoul,
+        "a pinned zone must key the same history the same way from any host timezone"
+    );
+    // Not just equal to each other — equal to what the pinned zone says.
+    // Los Angeles would report {03-02: 2} and Seoul {03-02: 1, 03-03: 1}, so
+    // agreeing on {03-03: 2} can only come from Pacific/Kiritimati.
+    assert_eq!(
+        from_los_angeles,
+        vec![("2026-03-03".to_string(), 2)],
+        "buckets must follow the pinned zone, not either host"
+    );
+}
+
+/// The other half of the contract: a device that has never pinned reports
+/// exactly what it reported before this change — day keys follow the machine.
+///
+/// Separate homes because the first run on a home pins it; this asserts the
+/// unpinned/first-scan semantics, which are the ones that must not move.
+#[test]
+fn test_unpinned_first_scan_still_buckets_by_the_host_timezone() {
+    let los_angeles = create_bucket_timezone_fixture_dir();
+    let seoul = create_bucket_timezone_fixture_dir();
+
+    assert_eq!(
+        graph_day_buckets(los_angeles.path(), "America/Los_Angeles"),
+        vec![("2026-03-02".to_string(), 2)],
+        "an unpinned device must bucket by its own timezone, unchanged"
+    );
+    assert_eq!(
+        graph_day_buckets(seoul.path(), "Asia/Seoul"),
+        vec![
+            ("2026-03-02".to_string(), 1),
+            ("2026-03-03".to_string(), 1)
+        ],
+        "an unpinned device must bucket by its own timezone, unchanged"
+    );
+}
+
+/// The first run records the zone, and recording it changes nothing about what
+/// that run reports. If pinning moved the numbers on the machine doing the
+/// pinning, every user would see a one-off jump on upgrade.
+#[test]
+fn test_first_run_pins_the_host_timezone_without_changing_its_own_output() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    assert!(!settings_path.exists(), "fixture must start unpinned");
+
+    let buckets = graph_day_buckets(tmp.path(), "Asia/Seoul");
+    assert_eq!(
+        buckets,
+        vec![
+            ("2026-03-02".to_string(), 1),
+            ("2026-03-03".to_string(), 1)
+        ],
+        "the run that pins must report what it would have reported unpinned"
+    );
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        settings["scanner"]["bucketTimezone"].as_str(),
+        Some("Asia/Seoul"),
+        "the first run must record the zone it bucketed into"
+    );
+
+    // And the recorded zone is what the *next* run uses, even from elsewhere.
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "America/Los_Angeles"),
+        buckets,
+        "the recorded zone must survive a host timezone change"
+    );
+}
+
+#[test]
+fn test_config_set_timezone_repoints_day_buckets() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone(tmp.path(), "America/Los_Angeles");
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "Asia/Seoul"),
+        vec![("2026-03-02".to_string(), 2)]
+    );
+
+    cmd_with_home(tmp.path())
+        .args(["config", "set", "timezone", "Pacific/Kiritimati"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pacific/Kiritimati"));
+
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "Asia/Seoul"),
+        vec![("2026-03-03".to_string(), 2)],
+        "`config set timezone` must move the day boundaries deliberately"
+    );
+
+    cmd_with_home(tmp.path())
+        .args(["config", "get", "timezone"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pacific/Kiritimati"));
+}
+
+/// A fixed UTC offset cannot follow daylight saving time, so pinning one would
+/// reintroduce a bounded version of the bug pinning removes. Reject it at the
+/// boundary rather than storing a value that silently degrades to unpinned.
+#[test]
+fn test_config_set_timezone_rejects_a_fixed_offset() {
+    let tmp = create_bucket_timezone_fixture_dir();
+
+    cmd_with_home(tmp.path())
+        .args(["config", "set", "timezone", "+09:00"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a known IANA timezone name"));
+}
+
+/// A hand-edited settings.json with a bad zone must not break scanning. It
+/// degrades to the pre-pinning behaviour, which is wrong in the old way rather
+/// than a hard failure on every command.
+#[test]
+fn test_unparseable_pinned_timezone_falls_back_to_the_host_timezone() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone(tmp.path(), "Mars/Olympus_Mons");
+
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "America/Los_Angeles"),
+        vec![("2026-03-02".to_string(), 2)],
+        "an unknown zone name must fall back to the host, not fail the scan"
+    );
+}

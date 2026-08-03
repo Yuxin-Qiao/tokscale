@@ -288,6 +288,26 @@ pub fn compute_daily_active_time(
     compute_daily_active_time_with_timezone(intervals, &chrono::Local)
 }
 
+/// Per-day active time keyed by the scan's bucketing timezone.
+///
+/// Active time is keyed by day just like tokens are, so it has to follow the
+/// same pinned zone or the two disagree about which day a session near midnight
+/// belongs to — and `active_time_ms` is written per `(device, date)` on the
+/// server alongside the token totals.
+pub fn compute_daily_active_time_in(
+    intervals: &[SessionInterval],
+    timezone: &crate::bucket_tz::BucketTimezone,
+) -> std::collections::HashMap<String, i64> {
+    match timezone {
+        crate::bucket_tz::BucketTimezone::Local => {
+            compute_daily_active_time_with_timezone(intervals, &chrono::Local)
+        }
+        crate::bucket_tz::BucketTimezone::Pinned(tz) => {
+            compute_daily_active_time_with_timezone(intervals, tz)
+        }
+    }
+}
+
 fn compute_daily_active_time_with_timezone<Tz>(
     intervals: &[SessionInterval],
     timezone: &Tz,

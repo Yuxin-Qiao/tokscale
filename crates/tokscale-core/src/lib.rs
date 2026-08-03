@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 mod aggregator;
+pub mod bucket_tz;
 mod cc_mirror;
 pub mod clients;
 pub mod content_extractor;
@@ -20,13 +21,14 @@ pub mod tui_signal;
 pub mod wiki;
 
 pub use aggregator::*;
+pub use bucket_tz::BucketTimezone;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use model_alias::ModelAliasMap;
 pub use parser::*;
 pub use scanner::*;
 pub use sessionize::{
-    compute_daily_active_time, compute_time_metrics, sessionize, SessionInterval, TimeMetrics,
-    DEFAULT_IDLE_GAP_MS,
+    compute_daily_active_time, compute_daily_active_time_in, compute_time_metrics, sessionize,
+    SessionInterval, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
 pub use sessions::{CostSource, UnifiedMessage};
 
@@ -2076,9 +2078,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         all_messages.extend(kiro_db_messages);
     }
 
+    // Crush decides its day split at parse time (it allocates session cost
+    // across days), so it needs the pinned zone here — the post-parse
+    // `rebucket_days` pass cannot recover a split this grouping collapsed.
+    let crush_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
     for source in &scan_result.crush_dbs {
         let crush_messages: Vec<UnifiedMessage> =
-            sessions::crush::parse_crush_sqlite(&source.db_path)
+            sessions::crush::parse_crush_sqlite_in(&source.db_path, &crush_bucket_timezone)
                 .into_iter()
                 .map(|mut msg| {
                     msg.set_workspace(source.workspace_key.clone(), source.workspace_label.clone());
@@ -2301,7 +2307,35 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
     source_cache.save_if_dirty();
 
+    rebucket_days(&mut all_messages, scanner_settings);
+
     all_messages
+}
+
+/// Re-key every message onto the device's pinned bucketing timezone.
+///
+/// The parsers derive `date` from `chrono::Local`, read afresh on every scan,
+/// so which day a message lands in changes when the machine's zone does. This
+/// is the one pass that knows the user's settings and sees every message, so it
+/// is where the day key gets fixed to something a rescan cannot move.
+///
+/// Runs after the source cache is written on purpose: the cache stores raw
+/// parser output and `refresh_derived_fields` re-derives `date` on every load,
+/// so cached entries never carry a stale day key past this point and changing
+/// the pinned zone needs no cache invalidation.
+///
+/// **No-op when nothing is pinned.** An unpinned device must report exactly
+/// what it reported before, so the pass is skipped rather than re-derived
+/// through `Local`.
+fn rebucket_days(messages: &mut [UnifiedMessage], scanner_settings: &scanner::ScannerSettings) {
+    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    if !timezone.is_pinned() {
+        return;
+    }
+
+    for message in messages.iter_mut() {
+        message.rebucket_date(&timezone);
+    }
 }
 
 fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
@@ -2853,7 +2887,15 @@ async fn generate_graph_with_loaded_pricing(
 
     let filtered = filter_messages_for_report(all_messages, &options);
 
-    build_graph_from_messages(filtered, pricing, pricing_requirement, start)
+    let bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
+    build_graph_from_messages(
+        filtered,
+        pricing,
+        pricing_requirement,
+        start,
+        &bucket_timezone,
+    )
 }
 
 fn build_graph_from_messages(
@@ -2861,6 +2903,7 @@ fn build_graph_from_messages(
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
     start: Instant,
+    bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Result<GraphResult, String> {
     if matches!(pricing_requirement, GraphPricingRequirement::Submission) {
         validate_priced_messages(&filtered, pricing)?;
@@ -2870,7 +2913,10 @@ fn build_graph_from_messages(
     let time_metrics =
         sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
 
-    let daily_active_time = sessionize::compute_daily_active_time(&intervals);
+    // Keyed by the same zone the messages were rebucketed into. Active time is
+    // joined onto contributions by date below, so a mismatch here silently
+    // drops a day's active time rather than misplacing it.
+    let daily_active_time = sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
     let contributions = aggregator::aggregate_by_date(filtered);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
@@ -3693,11 +3739,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         messages.extend(kiro_db_msgs);
     }
 
+    // See the crush block in `parse_all_messages_with_pricing_with_env_strategy`.
+    let crush_bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
     let crush_msgs: Vec<ParsedMessage> = scan_result
         .crush_dbs
         .par_iter()
         .flat_map(|source| {
-            sessions::crush::parse_crush_sqlite(&source.db_path)
+            sessions::crush::parse_crush_sqlite_in(&source.db_path, &crush_bucket_timezone)
                 .into_iter()
                 .map(|mut msg| {
                     msg.set_workspace(source.workspace_key.clone(), source.workspace_label.clone());
@@ -3925,6 +3974,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         }
     }
 
+    // Before the date filter, not after: `--since`/`--until` compare against
+    // `date`, so filtering first would select rows by the machine's live zone
+    // and then relabel them with the pinned one.
+    //
+    // This path builds `ParsedMessage` straight from the parsers instead of
+    // going through `parse_all_messages_with_pricing_with_env_strategy`, so it
+    // needs its own rebucket — `tokscale report` and `tokscale wrapped` read
+    // day keys from here.
+    rebucket_parsed_days(&mut messages, &options.scanner_settings);
+
     let filtered = filter_parsed_messages(messages, &options);
 
     Ok(ParsedMessages {
@@ -3932,6 +3991,26 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         counts,
         processing_time_ms: start.elapsed().as_millis() as u32,
     })
+}
+
+/// [`rebucket_days`] for the `ParsedMessage` lane. Same contract: no-op unless
+/// a zone is pinned.
+fn rebucket_parsed_days(
+    messages: &mut [ParsedMessage],
+    scanner_settings: &scanner::ScannerSettings,
+) {
+    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    if !timezone.is_pinned() {
+        return;
+    }
+
+    for message in messages.iter_mut() {
+        // See `UnifiedMessage::rebucket_date` for why an empty key is kept out.
+        let key = timezone.day_key(message.timestamp);
+        if !key.is_empty() {
+            message.date = key;
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -7490,6 +7569,7 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Lenient,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect("reporting graphs should retain unpriced usage");
         let submission_error = build_graph_from_messages(
@@ -7497,6 +7577,7 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Submission,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect_err("submission graphs should reject unpriced usage");
 

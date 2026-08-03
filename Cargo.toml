@@ -34,6 +34,21 @@ walkdir = "2"
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }
 
+# Named IANA timezones for the pinned bucketing zone (`scanner.bucketTimezone`).
+#
+# A `chrono::FixedOffset` would avoid this dependency but cannot follow DST, so
+# a pinned offset drifts an hour off local midnight twice a year and re-splits
+# usage near the day boundary — a bounded rerun of the bug pinning removes. The
+# named-zone variant is the only exact fix, so the tz database is the price.
+# `default-features = false` drops the `parse-zoneinfo`/`case-insensitive`
+# extras; `std` alone is enough for `FromStr` + `TimeZone`.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+
+# Reads the machine's IANA zone name so the CLI can pin it on first scan.
+# Already compiled into every build — `chrono` depends on it to implement
+# `Local` — so naming it here as a direct dependency adds no code to the binary.
+iana-time-zone = "0.1"
+
 # Error handling
 thiserror = "2"
 anyhow = "1.0"
