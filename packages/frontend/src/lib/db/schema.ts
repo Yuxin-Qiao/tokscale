@@ -417,6 +417,18 @@ export const dailyBreakdownRelations = relations(dailyBreakdown, ({ one }) => ({
  * take the max of imported and locally-scanned history instead of their sum,
  * silently dropping whichever is smaller.
  *
+ * The flip side of that key, also KNOWN and also left for Phase 2: `origin` is
+ * caller-controlled (`provenance.origin` on the payload), and the two origins
+ * ADD here while `daily_breakdown` MERGES. `mergeClientBreakdownsWithRegression
+ * Guard` REPLACES a client's day entry rather than summing it, so resubmitting
+ * the same history twice — once tagged `backfill`, once untagged — leaves the
+ * daily rows at H but leaves this table with two rows summing to 2H. Additivity
+ * across origins is only correct when the two bodies of history are DISJOINT,
+ * which is the honest case (import old history, scan recent history) but is not
+ * enforced. Phase 2 must not read `SUM(tokens_highwater)` across origins
+ * without accounting for this; Phase 1.5 surfaces it as a served/high-water
+ * ratio near 0.5, the same signature as the adoption case below.
+ *
  * KNOWN, and deliberately not fixed here — Phase 2 inherits it. The submit
  * route's legacy-adoption path re-parents a user's `daily_breakdown` rows from
  * the LEGACY device to their first device-aware device, so those days are

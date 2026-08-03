@@ -240,6 +240,14 @@ export async function recordDeviceClientTotals(params: {
  * seed it with the inflated value that `GREATEST` then keeps forever). Both
  * mean an absent bucket carries no information about usage, and any consumer
  * that reads it as 0 would report a fabricated collapse.
+ *
+ * `known` means "at least one bucket exists" — it does NOT mean coverage is
+ * complete. During the forced warm-up a user can easily have one bucket out of
+ * fifty, which reads as `known` with a total far below the served one. That is
+ * the correct behaviour for a MEASUREMENT (the gap is the signal) but it makes
+ * `status` unsafe as a Phase 2 readiness gate on its own. `bucketCount` is
+ * carried for exactly that reason: the gate belongs on coverage and on the
+ * observed delta, never on `status === "known"`.
  */
 export type HighwaterTotalReading =
   | { status: "unknown" }
