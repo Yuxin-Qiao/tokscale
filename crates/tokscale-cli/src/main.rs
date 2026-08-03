@@ -630,7 +630,7 @@ fn main() -> Result<()> {
                     hide_zero,
                 )
             } else {
-                let (since, until) = build_date_filter(&date);
+                let (since, until) = build_date_filter(&date, &cli.home);
                 let year = normalize_year_filter(&date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
@@ -667,7 +667,7 @@ fn main() -> Result<()> {
                     hide_zero,
                 )
             } else {
-                let (since, until) = build_date_filter(&date);
+                let (since, until) = build_date_filter(&date, &cli.home);
                 let year = normalize_year_filter(&date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
@@ -704,7 +704,7 @@ fn main() -> Result<()> {
                     hide_zero,
                 )
             } else {
-                let (since, until) = build_date_filter(&date);
+                let (since, until) = build_date_filter(&date, &cli.home);
                 let year = normalize_year_filter(&date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
@@ -753,7 +753,7 @@ fn main() -> Result<()> {
             benchmark,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date);
+            let (since, until) = build_date_filter(&date, &cli.home);
             let year = normalize_year_filter(&date);
             let clients = build_client_filter(clients, &cli.home);
             run_graph_command(
@@ -778,7 +778,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Tui { clients, date }) => {
             ensure_home_supported_for_tui(&cli.home)?;
-            let (since, until) = build_date_filter(&date);
+            let (since, until) = build_date_filter(&date, &cli.home);
             let year = normalize_year_filter(&date);
             let clients = build_client_filter(clients, &cli.home);
             auto_sync_cursor_before_tui(&cli.home, &clients)?;
@@ -799,7 +799,7 @@ fn main() -> Result<()> {
             dry_run,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
-            let (since, until) = build_date_filter(&date);
+            let (since, until) = build_date_filter(&date, &cli.home);
             let year = normalize_year_filter(&date);
             // Bypass settings.json defaultClients for the submit path: we want the
             // submit-specific default_submit_clients() fallback (in run_submit_command)
@@ -886,7 +886,7 @@ fn main() -> Result<()> {
             date,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date);
+            let (since, until) = build_date_filter(&date, &cli.home);
             let year = normalize_year_filter(&date);
             let clients = build_client_filter(clients, &cli.home);
             run_time_metrics_report(
@@ -925,7 +925,7 @@ fn main() -> Result<()> {
             let today = date.today;
             let week = date.week;
             let month = date.month;
-            let (since, until) = build_date_filter(&date);
+            let (since, until) = build_date_filter(&date, &cli.home);
             commands::report::run_report(commands::report::ReportOptions {
                 json,
                 since,
@@ -977,7 +977,7 @@ fn main() -> Result<()> {
                     cli.hide_zero,
                 )
             } else {
-                let (since, until) = build_date_filter(&cli.date);
+                let (since, until) = build_date_filter(&cli.date, &cli.home);
                 let year = normalize_year_filter(&cli.date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
@@ -1671,8 +1671,11 @@ fn ensure_home_supported_for_tui(home_dir: &Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn build_date_filter(date: &DateRangeFlags) -> (Option<String>, Option<String>) {
-    build_date_filter_for_date(date, current_bucket_date())
+fn build_date_filter(
+    date: &DateRangeFlags,
+    home_dir: &Option<String>,
+) -> (Option<String>, Option<String>) {
+    build_date_filter_for_date(date, current_bucket_date(home_dir))
 }
 
 /// Today, as the day keys this scan produces define it.
@@ -1681,11 +1684,20 @@ fn build_date_filter(date: &DateRangeFlags) -> (Option<String>, Option<String>) 
 /// timezone is pinned those strings stop tracking the host. Resolving "today"
 /// anywhere else would select the wrong day out of the right buckets.
 ///
+/// Takes the same `--home` override the scan does. Every date-filtered command
+/// builds its scanner settings with `load_scanner_settings_for_home`, so the
+/// buckets are keyed in the *target* profile's pinned zone; reading this
+/// machine's settings instead would filter another device's Seoul-keyed days
+/// against the host's calendar and hand back a partial day — the exact
+/// inconsistency pinning exists to remove, reintroduced at the filter.
+///
 /// Identical to `chrono::Local::now().date_naive()` when nothing is pinned,
 /// which is every device that has not upgraded yet.
-fn current_bucket_date() -> chrono::NaiveDate {
-    tokscale_core::BucketTimezone::from_scanner_settings(&tui::settings::load_scanner_settings())
-        .today()
+fn current_bucket_date(home_dir: &Option<String>) -> chrono::NaiveDate {
+    tokscale_core::BucketTimezone::from_scanner_settings(
+        &tui::settings::load_scanner_settings_for_home(home_dir),
+    )
+    .today()
 }
 
 fn build_date_filter_for_date(
@@ -1899,7 +1911,7 @@ fn run_models_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_model_report, GroupBy, ReportOptions};
 
-    let (since, until) = build_date_filter(date);
+    let (since, until) = build_date_filter(date, &home_dir);
     let year = normalize_year_filter(date);
     let date_range = get_date_range_label(date);
     let effective_home_dir = resolve_effective_home_dir(&home_dir);
@@ -2766,7 +2778,7 @@ fn run_monthly_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_monthly_report, GroupBy, ReportOptions};
 
-    let (since, until) = build_date_filter(date);
+    let (since, until) = build_date_filter(date, &home_dir);
     let year = normalize_year_filter(date);
     let date_range = get_date_range_label(date);
 
@@ -3089,7 +3101,7 @@ fn run_hourly_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_hourly_report, GroupBy, ReportOptions};
 
-    let (since, until) = build_date_filter(date);
+    let (since, until) = build_date_filter(date, &home_dir);
     let year = normalize_year_filter(date);
     let date_range = get_date_range_label(date);
 
@@ -7221,20 +7233,69 @@ mod tests {
         assert!(err.contains("Failed (401 Unauthorized): Not authenticated"));
     }
 
+    /// `--home` points at another device's profile, and every date-filtered
+    /// command already builds its scanner settings from that profile — so the
+    /// day keys it scans are in *that* device's pinned zone. Resolving "today"
+    /// from this machine's settings instead selects the wrong day out of the
+    /// right buckets, which is the inconsistency pinning exists to remove.
+    ///
+    /// Pacific/Kiritimati (UTC+14) and Pacific/Niue (UTC-11) are 25 hours
+    /// apart, so they are never on the same calendar date. A helper that
+    /// ignores its argument returns the same day for both homes.
+    #[test]
+    fn test_current_bucket_date_follows_the_home_overrides_pinned_zone() {
+        fn home_pinned_to(zone: &str) -> tempfile::TempDir {
+            let home = tempfile::TempDir::new().unwrap();
+            let config = home.path().join(if cfg!(windows) {
+                "AppData/Roaming/tokscale"
+            } else {
+                ".config/tokscale"
+            });
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join("settings.json"),
+                format!(r#"{{"scanner":{{"bucketTimezone":"{zone}"}}}}"#),
+            )
+            .unwrap();
+            home
+        }
+
+        let kiritimati_home = home_pinned_to("Pacific/Kiritimati");
+        let niue_home = home_pinned_to("Pacific/Niue");
+
+        let kiritimati =
+            current_bucket_date(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
+        let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
+
+        assert_eq!(
+            kiritimati,
+            tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati")).today(),
+            "the date filter must resolve today in the --home profile's pinned zone"
+        );
+        assert_ne!(
+            kiritimati, niue,
+            "two homes pinned 25 hours apart can never share a calendar date — \
+             equal values mean the override was ignored"
+        );
+    }
+
     #[test]
     fn test_build_date_filter_custom_range() {
-        let (since, until) = build_date_filter(&DateRangeFlags {
-            since: Some("2024-01-01".to_string()),
-            until: Some("2024-12-31".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let (since, until) = build_date_filter(
+            &DateRangeFlags {
+                since: Some("2024-01-01".to_string()),
+                until: Some("2024-12-31".to_string()),
+                ..DateRangeFlags::default()
+            },
+            &None,
+        );
         assert_eq!(since, Some("2024-01-01".to_string()));
         assert_eq!(until, Some("2024-12-31".to_string()));
     }
 
     #[test]
     fn test_build_date_filter_no_filters() {
-        let (since, until) = build_date_filter(&DateRangeFlags::default());
+        let (since, until) = build_date_filter(&DateRangeFlags::default(), &None);
         assert_eq!(since, None);
         assert_eq!(until, None);
     }
