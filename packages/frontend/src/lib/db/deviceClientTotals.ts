@@ -111,8 +111,22 @@ export function isDeviceClientTotalsWriteEnabled(
  */
 export function monthBucketKey(date: string): string | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-  const month = Number(date.slice(5, 7));
-  if (month < 1 || month > 12) return null;
+
+  // Round-trip through UTC rather than range-checking the month alone. A date
+  // like `2026-02-31` is not a calendar day, but slicing the month off it still
+  // yields a plausible `2026-02` — so an impossible day would silently land in
+  // a real bucket and skew that month's high-water.
+  //
+  // Note the NaN check is NOT sufficient on its own: `new Date("2026-02-31Z")`
+  // does not fail, it ROLLS OVER to 2026-03-03. Deriving the bucket from the
+  // parsed value would then file February usage under March, which is worse
+  // than the slice it replaced. Comparing the round-trip back to the input is
+  // what actually rejects it, and it gets leap years right for free
+  // (`2024-02-29` passes, `2025-02-29` does not).
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  if (parsed.toISOString().slice(0, 10) !== date) return null;
+
   return date.slice(0, 7);
 }
 
@@ -456,7 +470,15 @@ export function buildDualDerivationRecord(params: {
     servedCost: params.servedCost,
     snapshotTokens: params.snapshotTokens,
     snapshotCost: params.snapshotCost,
-    racedConcurrentSubmit: params.snapshotTokens !== params.servedTokens,
+    // Costs are compared too, not just tokens. A concurrent submit that moved
+    // only the cost — a reprice, or usage whose tokens were already counted —
+    // is still a race, and reporting it as `false` would let the census read a
+    // delta computed across two different states as if it were stable. Exact
+    // comparison is safe here: both sides come from the same numeric(18,4)
+    // column via the same conversion, so equal stored values are equal doubles.
+    racedConcurrentSubmit:
+      params.snapshotTokens !== params.servedTokens ||
+      params.snapshotCost !== params.servedCost,
   };
 
   if (highwater.status === "unknown") {

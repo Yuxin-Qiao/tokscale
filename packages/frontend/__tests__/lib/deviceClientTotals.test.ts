@@ -74,6 +74,23 @@ describe("monthBucketKey", () => {
     expect(monthBucketKey("2026-13-01")).toBeNull();
     expect(monthBucketKey("")).toBeNull();
   });
+
+  // A day that does not exist is well-formed enough to survive a shape check
+  // and a month range check, and slicing it still yields a real-looking month.
+  // Note `new Date("2026-02-31Z")` does not throw — it rolls over to March — so
+  // bucketing the parsed value would file February usage under March.
+  it("rejects days that do not exist rather than folding them", () => {
+    expect(monthBucketKey("2026-02-31")).toBeNull();
+    expect(monthBucketKey("2026-04-31")).toBeNull();
+    expect(monthBucketKey("2026-06-00")).toBeNull();
+  });
+
+  it("gets leap years right", () => {
+    expect(monthBucketKey("2024-02-29")).toBe("2024-02");
+    expect(monthBucketKey("2025-02-29")).toBeNull();
+    expect(monthBucketKey("2000-02-29")).toBe("2000-02");
+    expect(monthBucketKey("1900-02-29")).toBeNull();
+  });
 });
 
 describe("foldContributionsIntoBuckets", () => {
@@ -468,6 +485,24 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
     expect(record.racedConcurrentSubmit).toBe(true);
     // ...and the value actually served is still reported unchanged.
     expect(record.servedTokens).toBe(1200);
+  });
+
+  // A concurrent submit that moved only the cost is still a race. Comparing
+  // tokens alone reported it as `false`, which would let the census treat a
+  // delta computed across two different states as a stable reading.
+  it("records a cost-only concurrent submit as a race", () => {
+    const record = buildDualDerivationRecord({
+      userId: "u1",
+      submissionId: "s1",
+      servedTokens: 1500,
+      servedCost: 3,
+      snapshotTokens: 1500,
+      snapshotCost: 4.25,
+      highwater: { status: "known", tokens: 1500, cost: 4.25, bucketCount: 6 },
+    });
+
+    expect(record.racedConcurrentSubmit).toBe(true);
+    expect(record.servedCost).toBe(3);
   });
 
   it("emits a null delta, not the served total, while coverage is unknown", () => {
