@@ -460,20 +460,36 @@ impl Settings {
         // has explicitly pinned a config root via `TOKSCALE_CONFIG_DIR` so
         // CI sandboxes and isolated profiles stay hermetic instead of
         // silently ingesting personal settings from the legacy macOS path.
-        let raw = match primary {
-            RawSettings::Missing if !crate::paths::is_config_dir_overridden() => {
-                match Self::legacy_macos_path() {
-                    Some(legacy) => Self::read_config_file(&legacy),
-                    None => RawSettings::Missing,
-                }
-            }
-            other => other,
+        //
+        // The fallback is attempted whenever the primary is not readable, not
+        // only when it is missing — that is what it did before this function
+        // reported an origin, and narrowing it would lose the legacy file to a
+        // permissions error on the new path.
+        let legacy = match primary {
+            RawSettings::Present(_) => None,
+            _ if crate::paths::is_config_dir_overridden() => None,
+            _ => Self::legacy_macos_path().map(|legacy| Self::read_config_file(&legacy)),
+        };
+
+        // `save()` writes to the primary path whatever was read, so an
+        // unreadable primary stays unreadable even when the legacy file
+        // supplies the values: a write would still land on top of the file we
+        // could not see.
+        let primary_was_unreadable = matches!(primary, RawSettings::Unreadable);
+
+        let raw = match (primary, legacy) {
+            (RawSettings::Present(content), _) => RawSettings::Present(content),
+            (_, Some(RawSettings::Present(content))) => RawSettings::Present(content),
+            (primary, _) => primary,
         };
 
         match raw {
             RawSettings::Missing => (Self::default(), SettingsOrigin::Absent),
             RawSettings::Unreadable => (Self::default(), SettingsOrigin::Unreadable),
             RawSettings::Present(content) => match serde_json::from_str::<Settings>(&content) {
+                Ok(settings) if primary_was_unreadable => {
+                    (settings.normalize(), SettingsOrigin::Unreadable)
+                }
                 Ok(settings) => (settings.normalize(), SettingsOrigin::Parsed),
                 Err(_) => (Self::default(), SettingsOrigin::Unreadable),
             },
