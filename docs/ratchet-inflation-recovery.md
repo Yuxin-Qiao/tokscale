@@ -520,6 +520,49 @@ variant, the sentence at the top of this phase — "the only exact fix" — stop
 being true, and the residual is usage within an hour of local midnight on the
 days following a DST transition.
 
+### Naming the zone is a second, separate problem (2026-08-03)
+
+Pinning has two halves and only one of them was in the design above. Recording a
+zone is easy; deciding *which* zone the device is already using is not, and the
+first implementation got it wrong in a way that would have shipped.
+
+`chrono::Local` honors the `TZ` environment variable. `iana-time-zone` — the
+obvious way to get a name, and already in the tree — **does not read `TZ` at all
+on Linux**; it resolves `/etc/localtime`, then `/etc/timezone`. On macOS it goes
+through CoreFoundation, which does consult `TZ`.
+
+So on a Linux host with `TZ=Asia/Seoul` and `/etc/localtime -> Etc/UTC` the
+detector says `Etc/UTC` while every date already on disk says Seoul. Auto-pinning
+that name re-keys the entire history by nine hours on the first run after
+upgrading — the exact re-split this phase exists to remove, caused by the phase,
+and invisible to anyone developing on a Mac. CI caught it; the local test run did
+not, because the platform difference *is* the bug.
+
+The fix is not "use the other source". Either source can be wrong, and a future
+platform can disagree in a new way. The fix is to stop trusting the name and
+verify it: a candidate is pinned only if its UTC offset matches `chrono::Local`
+at every sampled instant across an eleven-year window. If it disagrees anywhere,
+nothing is written and the device stays unpinned — which is its previous
+behaviour, and therefore always safe.
+
+That turns the guarantee from "two crates presumably agree" into something
+structural: **the recorded zone produces the same day keys as the zone the device
+was already using, or there is no recorded zone.** Any future change to how the
+zone is detected inherits the guarantee for free, because the check is on the
+value, not on its provenance.
+
+The sampling step is set by what the tz database can express rather than by
+taste: DST offsets move in whole or half hours, and the tightest real case is a
+30-minute shift (`Australia/Lord_Howe` against `Australia/Sydney`), so a
+6-hour step would have stepped straight over it. 192,721 lookups, 11.4 ms
+release, once per scan while unpinned.
+
+**Generalisable:** any time a value is derived from the environment by two
+different libraries, the invariant to test is that they agree — not that either
+one is correct. And measure the real call: benchmarking `zones_agree` between two
+`chrono-tz` zones read 30% low, because `chrono::Local` re-checks `TZ` on every
+lookup and the proxy had no `Local` in it.
+
 ## Phase 4 — Heal the daily rows
 
 For the day-level surfaces, and only if Phase 1's census says the tail justifies
