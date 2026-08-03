@@ -4194,3 +4194,105 @@ fn test_auto_pinning_recovers_from_a_bucket_timezone_that_names_no_zone() {
         assert_eq!(pinned_zone(tmp.path()), detected);
     }
 }
+
+/// Whether mode 000 actually denies a read here. Root ignores it, and so do
+/// some container filesystems, and the tests below have nothing to assert when
+/// the file they made unreadable can still be read. Probes the real behaviour
+/// rather than inferring it from the uid.
+#[cfg(unix)]
+fn mode_000_denies_reads(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = dir.join(".mode-probe");
+    fs::write(&probe, "probe").unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::read_to_string(&probe).is_err();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&probe).unwrap();
+    denied
+}
+
+/// `read_to_string(..).ok()` collapses "no such file" into the same `None` as
+/// "this file exists and I could not open it". Auto-pinning has to tell them
+/// apart: the first is safe to write, the second is a file whose contents are
+/// still on disk and still unknown.
+///
+/// A parse failure is covered by
+/// `test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read`; this
+/// is the I/O half, which never reaches the parser at all.
+#[cfg(unix)]
+#[test]
+fn test_auto_pinning_declines_when_settings_json_cannot_be_opened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = create_bucket_timezone_fixture_dir();
+    if !mode_000_denies_reads(tmp.path()) {
+        return;
+    }
+
+    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::write(&settings_path, r#"{"colorPalette":"green"}"#).unwrap();
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    cmd_with_home(tmp.path())
+        .env("TZ", "Asia/Seoul")
+        .args(["graph", "--client", "opencode", "--no-spinner"])
+        .assert()
+        .success();
+
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        fs::read_to_string(&settings_path).unwrap(),
+        r#"{"colorPalette":"green"}"#,
+        "a settings.json that could not be opened must be left byte-identical"
+    );
+}
+
+/// The macOS fallback only fires while the canonical path is absent, so writing
+/// a primary settings.json shadows the legacy file for good — a legacy file the
+/// user could otherwise have repaired. Auto-pinning must not create one on top
+/// of a legacy file it could not open.
+///
+/// macOS-only: `legacy_macos_config_dir()` returns `None` everywhere else, so
+/// there is no fallback to shadow. Uses a permissions failure rather than bad
+/// JSON because unparseable legacy *content* is read successfully and blocked
+/// one step later, by the parse arm.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = create_bucket_timezone_fixture_dir();
+    if !mode_000_denies_reads(tmp.path()) {
+        return;
+    }
+
+    let legacy = tmp
+        .path()
+        .join("Library/Application Support/tokscale/settings.json");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, r#"{"colorPalette":"green"}"#).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let primary = tmp.path().join(".config/tokscale/settings.json");
+    assert!(!primary.exists(), "fixture must start with no primary file");
+
+    cmd_with_home(tmp.path())
+        .env("TZ", "Asia/Seoul")
+        .args(["graph", "--client", "opencode", "--no-spinner"])
+        .assert()
+        .success();
+
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !primary.exists(),
+        "writing a primary settings.json would shadow the legacy file the user \
+         still has to repair"
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy).unwrap(),
+        r#"{"colorPalette":"green"}"#,
+        "and the legacy file itself must be left alone"
+    );
+}

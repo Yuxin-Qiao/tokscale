@@ -480,6 +480,13 @@ impl Settings {
         let raw = match (primary, legacy) {
             (RawSettings::Present(content), _) => RawSettings::Present(content),
             (_, Some(RawSettings::Present(content))) => RawSettings::Present(content),
+            // A legacy file we could not *open* outranks a missing primary.
+            // (Legacy content that fails to parse is already `Present` here and
+            // is caught below.) It holds settings the user can still repair,
+            // and writing a primary would shadow it permanently: the fallback
+            // only fires while the primary is absent, so the repaired legacy
+            // file would never be read again.
+            (_, Some(RawSettings::Unreadable)) => RawSettings::Unreadable,
             (primary, _) => primary,
         };
 
