@@ -447,6 +447,21 @@ pub fn record_run_error(error: &str) -> Result<()> {
     settings.save()
 }
 
+/// Today, in the zone this device buckets day keys into.
+///
+/// A scheduled run submits, so "today" has to be the pinned zone's today — the
+/// same one the day buckets are keyed by. Reading the host clock here would
+/// select a partial pinned day out of correctly-keyed buckets, and a partial
+/// day is exactly what the server's monotonic per-day guard then freezes at the
+/// low value. `--home` is rejected for autosubmit, so there is only ever one
+/// profile in play.
+fn current_bucket_date() -> chrono::NaiveDate {
+    tokscale_core::BucketTimezone::from_scanner_settings(
+        &crate::tui::settings::load_scanner_settings(),
+    )
+    .today()
+}
+
 pub fn submit_filters(
     settings: &AutosubmitSettings,
 ) -> (
@@ -469,15 +484,7 @@ pub fn submit_filters(
         until: settings.until.clone(),
         year: settings.year.clone(),
     };
-    // Scheduled runs submit, so "today" has to be the pinned zone's today — the
-    // same one the day buckets are keyed by. Reading the host clock here would
-    // select a partial pinned day, and a partial day is exactly what the
-    // server's monotonic guard then freezes at the low value.
-    let current_date = tokscale_core::BucketTimezone::from_scanner_settings(
-        &crate::tui::settings::load_scanner_settings(),
-    )
-    .today();
-    let (since, until) = build_date_filter_for_date(&date, current_date);
+    let (since, until) = build_date_filter_for_date(&date, current_bucket_date());
     let year = if date.today || date.yesterday || date.week || date.month {
         None
     } else {
@@ -2430,6 +2437,57 @@ mod tests {
         assert_eq!(since.as_deref(), Some("2026-01-01"));
         assert_eq!(until.as_deref(), Some("2026-01-31"));
         assert_eq!(year, None);
+    }
+
+    /// Scheduled autosubmit is the one date-filtered path that *submits*, so a
+    /// "today" resolved from the host instead of the pinned zone selects a
+    /// partial day out of correctly-keyed buckets — and the server's monotonic
+    /// per-day guard then freezes that low value forever.
+    ///
+    /// Pacific/Kiritimati (UTC+14) and Pacific/Niue (UTC-11) are 25 hours
+    /// apart, so they are never on the same calendar date. Reading
+    /// `chrono::Local` would hand back the same day for both pins; only reading
+    /// the pin can tell them apart.
+    #[test]
+    #[serial_test::serial]
+    fn submit_filters_resolve_today_in_the_pinned_bucket_timezone() {
+        fn today_for_pinned_zone(zone: &str) -> Option<String> {
+            let temp = TempDir::new().unwrap();
+            std::fs::write(
+                temp.path().join("settings.json"),
+                format!(r#"{{"scanner":{{"bucketTimezone":"{zone}"}}}}"#),
+            )
+            .unwrap();
+            let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+            let settings = AutosubmitSettings {
+                today: true,
+                ..AutosubmitSettings::default()
+            };
+            let (_, since, until, _) = submit_filters(&settings);
+            assert_eq!(since, until, "--today is a single-day range");
+            since
+        }
+
+        let kiritimati = today_for_pinned_zone("Pacific/Kiritimati");
+        let niue = today_for_pinned_zone("Pacific/Niue");
+
+        assert_eq!(
+            kiritimati.as_deref(),
+            Some(
+                tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"))
+                    .today()
+                    .format("%Y-%m-%d")
+                    .to_string()
+                    .as_str()
+            ),
+            "autosubmit must resolve today in the pinned zone, not the host's"
+        );
+        assert_ne!(
+            kiritimati, niue,
+            "two pins 25 hours apart can never share a calendar date — equal \
+             values mean the host clock was read instead of the pin"
+        );
     }
 
     #[test]
