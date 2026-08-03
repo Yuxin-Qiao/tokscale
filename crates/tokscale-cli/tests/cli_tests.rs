@@ -3956,3 +3956,37 @@ fn test_unparseable_pinned_timezone_falls_back_to_the_host_timezone() {
         "an unknown zone name must fall back to the host, not fail the scan"
     );
 }
+
+/// Naming the local zone and bucketing in it go through different code with
+/// different rules. `chrono::Local` honors `TZ`; `iana-time-zone` does not read
+/// `TZ` at all on Linux — it resolves `/etc/localtime`. A host where those two
+/// disagree is ordinary (any `TZ=...` in a shell profile, any CI container),
+/// and pinning the detected name there would re-key the whole history on the
+/// first run after upgrading.
+///
+/// `TZ=XYZ8` is a POSIX rule string, not a zone name: `chrono::Local` honors it
+/// as UTC-8, and no detector will ever return it. So either the guard declines
+/// to pin, or it pins something that buckets identically — and the assertion
+/// below holds under both without caring which happened, which is the actual
+/// contract.
+#[test]
+fn test_first_run_never_rebuckets_when_the_detector_disagrees_with_local() {
+    let tmp = create_bucket_timezone_fixture_dir();
+
+    // UTC-8: 03:30 and 10:00 on 2026-03-02 — one day, both messages.
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "XYZ8"),
+        vec![("2026-03-02".to_string(), 2)],
+        "the first run must bucket by chrono::Local no matter what the zone \
+         detector reports"
+    );
+
+    // Whatever it recorded, a second run has to agree with the first. A pin
+    // that moved the buckets would show up here even if the first run's
+    // assertion happened to match by luck.
+    assert_eq!(
+        graph_day_buckets(tmp.path(), "XYZ8"),
+        vec![("2026-03-02".to_string(), 2)],
+        "the recorded zone must reproduce what the first run reported"
+    );
+}

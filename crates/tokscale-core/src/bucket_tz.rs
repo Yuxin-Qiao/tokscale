@@ -111,6 +111,20 @@ impl BucketTimezone {
             Self::Pinned(tz) => format_day_key(timestamp_ms, tz),
         }
     }
+
+    /// The `YYYY-MM-DD HH:00` hour key this instant falls in.
+    ///
+    /// The hourly report is display-only — it is never submitted — but its keys
+    /// embed a date, and its fallback branch for timestamp-less messages builds
+    /// one out of `date`, which the rebucket pass has already moved. Reading the
+    /// two halves out of different zones would let a single report contradict
+    /// itself about which day an hour belongs to.
+    pub fn hour_key(&self, timestamp_ms: i64) -> Option<String> {
+        match self {
+            Self::Local => format_hour_key(timestamp_ms, &chrono::Local),
+            Self::Pinned(tz) => format_hour_key(timestamp_ms, tz),
+        }
+    }
 }
 
 /// Format an instant as a `YYYY-MM-DD` day key in `timezone`.
@@ -131,23 +145,134 @@ where
     }
 }
 
-/// The machine's current IANA zone name, if it can be determined.
+/// Format an instant as a `YYYY-MM-DD HH:00` hour key in `timezone`.
+/// `None` for an instant the zone cannot represent, so callers can fall back.
+fn format_hour_key<Tz>(timestamp_ms: i64, timezone: &Tz) -> Option<String>
+where
+    Tz: TimeZone,
+    Tz::Offset: Display,
+{
+    match timezone.timestamp_millis_opt(timestamp_ms) {
+        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%d %H:00").to_string()),
+        _ => None,
+    }
+}
+
+/// The machine's current IANA zone name, if one can be determined **and** it
+/// reproduces `chrono::Local` exactly.
 ///
-/// `iana-time-zone` is already in the dependency graph — `chrono` pulls it in
-/// to implement `Local` — so reading the name costs no new code in the binary.
+/// Returns `None` when the platform cannot name its zone (a bare `TZ=+09:00`, a
+/// container with no zoneinfo) or when the name it gives disagrees with
+/// `chrono::Local`. Callers must treat `None` as "do not pin" rather than
+/// substituting a fixed offset: an offset that cannot follow DST is exactly the
+/// failure mode pinning exists to remove.
 ///
-/// Returns `None` when the platform cannot name its zone (a bare `TZ=+09:00`,
-/// a container with no zoneinfo). Callers must treat that as "do not pin"
-/// rather than substituting a fixed offset: an offset that cannot follow DST is
-/// exactly the failure mode pinning exists to remove.
+/// # Why the agreement check is not optional
+///
+/// Naming the local zone and *bucketing* in the local zone go through different
+/// code with different rules, and they disagree in ordinary setups:
+///
+/// - `chrono::Local` honors the `TZ` environment variable.
+/// - `iana_time_zone::get_timezone()` **does not read `TZ` at all** on Linux —
+///   it resolves `/etc/localtime`, then `/etc/timezone`. On macOS it goes
+///   through CoreFoundation, which *does* consult `TZ`.
+///
+/// So on a Linux host with `TZ=Asia/Seoul` and `/etc/localtime -> Etc/UTC`,
+/// the detector says `Etc/UTC` while every date the parsers produced said
+/// Seoul. Pinning the detected name there would re-key the entire history by
+/// nine hours on the first run after upgrading — the exact re-split this
+/// feature exists to prevent, caused by the feature, and invisible on macOS.
+///
+/// Verifying against `chrono::Local` before writing anything makes the
+/// invariant structural instead of dependent on two crates happening to agree:
+/// the zone recorded is one that produces the same day keys as the zone the
+/// device was already using, or no zone is recorded at all.
 pub fn detect_local_iana_name() -> Option<String> {
-    let name = iana_time_zone::get_timezone().ok()?;
-    // Round-trip through the tz database. A name we cannot parse back is a
-    // name we could not honor on a later scan, and pinning it would silently
-    // fall back to `Local` forever.
-    name.parse::<chrono_tz::Tz>()
-        .ok()
-        .map(|tz| tz.name().to_string())
+    let candidate = candidate_local_zone()?;
+
+    if !zones_agree(&candidate, &chrono::Local) {
+        tracing::debug!(
+            candidate = candidate.name(),
+            "detected timezone does not reproduce chrono::Local — leaving the \
+             bucketing timezone unpinned rather than re-keying history"
+        );
+        return None;
+    }
+
+    Some(candidate.name().to_string())
+}
+
+/// The zone this machine claims to be in, as an IANA name.
+///
+/// `TZ` is consulted first because it is what `chrono::Local` itself honors,
+/// and `chrono::Local` is what produced every date already on disk. Falling
+/// back to `iana-time-zone` covers the normal case where `TZ` is unset.
+///
+/// Either source can be wrong or absent; [`detect_local_iana_name`] verifies
+/// the result regardless of which one produced it.
+fn candidate_local_zone() -> Option<chrono_tz::Tz> {
+    tz_env_zone().or_else(|| iana_time_zone::get_timezone().ok()?.parse().ok())
+}
+
+/// `TZ` as an IANA zone, if it names one.
+///
+/// POSIX allows a leading colon (`TZ=:Asia/Seoul`). Values that are not zone
+/// names — `TZ=EST5EDT`-style rules, `TZ=<+09>-9`, a path — return `None`;
+/// those are honored by `chrono::Local` but cannot be stored as a pinned name.
+fn tz_env_zone() -> Option<chrono_tz::Tz> {
+    let raw = std::env::var("TZ").ok()?;
+    let name = raw.strip_prefix(':').unwrap_or(&raw);
+    name.parse::<chrono_tz::Tz>().ok()
+}
+
+/// Whether two zones are observationally identical for bucketing purposes.
+///
+/// Day keys depend on a zone only through its UTC offset, so two zones that
+/// agree on offset at every instant produce identical buckets and are
+/// interchangeable here — `Etc/UTC` and `UTC`, or `America/New_York` and
+/// `America/Toronto`. Anything that differs anywhere in the sampled window
+/// would move a day boundary, and is rejected.
+///
+/// Sampled rather than proven: every 6 hours from 8 years back to 1 year
+/// ahead, which is ~13k offset lookups (a binary search each) and runs once,
+/// on the first scan. That window covers the history a device could plausibly
+/// hold and every DST season in it. The residual is two zones whose offsets
+/// differ only inside a window shorter than the step — bounded to hours on a
+/// transition day, versus the unbounded whole-history re-split this replaces.
+fn zones_agree<A, B>(candidate: &A, reference: &B) -> bool
+where
+    A: TimeZone,
+    B: TimeZone,
+{
+    const STEP_MS: i64 = 6 * 60 * 60 * 1000;
+    const YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let start = now - 8 * YEAR_MS;
+    let end = now + YEAR_MS;
+
+    let mut at = start;
+    while at <= end {
+        if offset_seconds(candidate, at) != offset_seconds(reference, at) {
+            return false;
+        }
+        at += STEP_MS;
+    }
+
+    true
+}
+
+/// The zone's UTC offset in seconds at an instant, or `None` if unrepresentable.
+fn offset_seconds<Tz>(timezone: &Tz, timestamp_ms: i64) -> Option<i32>
+where
+    Tz: TimeZone,
+{
+    use chrono::Offset;
+
+    timezone
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|dt| dt.offset().fix().local_minus_utc())
 }
 
 #[cfg(test)]
@@ -243,6 +368,67 @@ mod tests {
         );
     }
 
+    /// Zones that produce the same offset at every instant produce the same day
+    /// keys, so they are interchangeable and pinning either is a no-op.
+    #[test]
+    fn observationally_identical_zones_agree() {
+        let utc: chrono_tz::Tz = "Etc/UTC".parse().unwrap();
+        assert!(zones_agree(&utc, &chrono::Utc));
+        assert!(zones_agree(&utc, &"UTC".parse::<chrono_tz::Tz>().unwrap()));
+
+        // Same rules, different names — a device may legitimately be detected
+        // as either and neither moves a day boundary.
+        let new_york: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let toronto: chrono_tz::Tz = "America/Toronto".parse().unwrap();
+        assert!(zones_agree(&new_york, &toronto));
+    }
+
+    /// The guard that keeps the first run from re-keying history.
+    #[test]
+    fn zones_with_different_offsets_are_rejected() {
+        let seoul: chrono_tz::Tz = "Asia/Seoul".parse().unwrap();
+        let utc: chrono_tz::Tz = "Etc/UTC".parse().unwrap();
+        assert!(
+            !zones_agree(&seoul, &utc),
+            "a nine-hour difference must never be accepted as the same zone"
+        );
+
+        // The subtle case: identical offset for part of the year, different DST
+        // rules. Sampling a single instant would let this through in winter.
+        let london: chrono_tz::Tz = "Europe/London".parse().unwrap();
+        assert!(
+            !zones_agree(&london, &utc),
+            "matching offsets in winter must not pass for a zone that observes DST"
+        );
+
+        // And against a fixed offset, which is what a `TZ=<+09>-9` host looks
+        // like to `chrono::Local`: same offset now, no transitions ever.
+        let fixed_seoul = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert!(zones_agree(&seoul, &fixed_seoul), "Asia/Seoul has no DST");
+        assert!(
+            !zones_agree(&london, &chrono::FixedOffset::east_opt(0).unwrap()),
+            "a fixed offset cannot stand in for a zone that observes DST"
+        );
+    }
+
+    #[test]
+    fn tz_env_is_read_as_a_zone_name_only_when_it_is_one() {
+        // Not asserting on the live environment — exercising the parse rule the
+        // TZ path uses, including the POSIX leading colon.
+        assert_eq!(
+            "Asia/Seoul".parse::<chrono_tz::Tz>().ok(),
+            ":Asia/Seoul"
+                .strip_prefix(':')
+                .unwrap()
+                .parse::<chrono_tz::Tz>()
+                .ok()
+        );
+        // POSIX rule strings are honored by `chrono::Local` but are not names
+        // that can be pinned, so they must fall through to the detector.
+        assert!("<+09>-9".parse::<chrono_tz::Tz>().is_err());
+        assert!("/etc/localtime".parse::<chrono_tz::Tz>().is_err());
+    }
+
     #[test]
     fn detection_either_names_a_real_zone_or_declines() {
         // Host-dependent, so assert the contract rather than a value: whatever
@@ -252,6 +438,13 @@ mod tests {
             assert!(
                 BucketTimezone::from_pinned_name(Some(&name)).is_pinned(),
                 "detected zone {name} must be re-resolvable"
+            );
+            // The contract that makes auto-pinning safe: whatever comes back
+            // buckets identically to what the parsers already used.
+            let pinned: chrono_tz::Tz = name.parse().unwrap();
+            assert!(
+                zones_agree(&pinned, &chrono::Local),
+                "detected zone {name} must reproduce chrono::Local"
             );
         }
     }

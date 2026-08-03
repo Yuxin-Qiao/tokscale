@@ -469,7 +469,15 @@ pub fn submit_filters(
         until: settings.until.clone(),
         year: settings.year.clone(),
     };
-    let (since, until) = build_date_filter_for_date(&date, chrono::Local::now().date_naive());
+    // Scheduled runs submit, so "today" has to be the pinned zone's today — the
+    // same one the day buckets are keyed by. Reading the host clock here would
+    // select a partial pinned day, and a partial day is exactly what the
+    // server's monotonic guard then freezes at the low value.
+    let current_date = tokscale_core::BucketTimezone::from_scanner_settings(
+        &crate::tui::settings::load_scanner_settings(),
+    )
+    .today();
+    let (since, until) = build_date_filter_for_date(&date, current_date);
     let year = if date.today || date.yesterday || date.week || date.month {
         None
     } else {

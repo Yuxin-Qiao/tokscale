@@ -39,7 +39,13 @@ pub fn run_report(opts: ReportOptions) -> Result<()> {
 
     populate_wiki_from_sessions(&db, &opts)?;
 
-    let (since_ts, until_ts) = parse_date_range(&opts.since, &opts.until);
+    // Day boundaries have to be resolved in the same zone the day keys are built
+    // from, or a pinned device filters pinned-day strings against host-day
+    // instants and loses an offset's worth of sessions at each edge.
+    let bucket_timezone = tokscale_core::BucketTimezone::from_scanner_settings(
+        &crate::tui::settings::load_scanner_settings_for_home(&opts.home_dir),
+    );
+    let (since_ts, until_ts) = parse_date_range(&opts.since, &opts.until, &bucket_timezone);
 
     if opts.rebuild {
         let count = db
@@ -1455,46 +1461,63 @@ fn extract_content_for_session(
     extract_session_content(&entry.client, &entry.session_id, &candidates)
 }
 
-fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i64>, Option<i64>) {
-    // The `since`/`until` strings are local-calendar dates (e.g. produced by
-    // `build_date_filter`, which derives them from `chrono::Local::now()`), and
-    // session dates are bucketed in local time (see
-    // `sessions::timestamp_to_date`). Interpret the day boundaries in local time
-    // so filtering lines up with grouping and avoids off-by-a-day mismatches.
+fn parse_date_range(
+    since: &Option<String>,
+    until: &Option<String>,
+    bucket_timezone: &tokscale_core::BucketTimezone,
+) -> (Option<i64>, Option<i64>) {
+    // The `since`/`until` strings are calendar dates in the scan's bucketing
+    // zone (e.g. produced by `build_date_filter`), and session dates are keyed
+    // in that same zone. Interpret the day boundaries there too, so filtering
+    // lines up with grouping and avoids off-by-a-day mismatches. With nothing
+    // pinned this resolves through `chrono::Local`, exactly as before.
     let since_ts = since
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(local_start_of_day_millis);
+        .and_then(|d| start_of_day_millis(d, bucket_timezone));
     let until_ts = until
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         .and_then(|d| d.succ_opt())
-        .and_then(|next| local_start_of_day_millis(next).map(|ms| ms - 1));
+        .and_then(|next| start_of_day_millis(next, bucket_timezone).map(|ms| ms - 1));
     (since_ts, until_ts)
 }
 
-/// Returns the Unix-millisecond timestamp for the start of `date` in the local
-/// timezone.
+/// Returns the Unix-millisecond timestamp for the start of `date` in the scan's
+/// bucketing timezone.
 ///
 /// This is normally midnight (00:00:00), but in zones that spring forward at
 /// local midnight (e.g. `America/Nuuk` on `2024-03-31`) that wall-clock time
 /// does not exist. Rather than dropping the boundary (which would silently make
 /// date filtering unbounded), we walk forward to the first representable instant
 /// after the gap so the day boundary is preserved.
-fn local_start_of_day_millis(date: chrono::NaiveDate) -> Option<i64> {
-    start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
+fn start_of_day_millis(
+    date: chrono::NaiveDate,
+    bucket_timezone: &tokscale_core::BucketTimezone,
+) -> Option<i64> {
+    use chrono::TimeZone;
+
+    match bucket_timezone {
+        tokscale_core::BucketTimezone::Local => {
+            start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
+        }
+        tokscale_core::BucketTimezone::Pinned(tz) => {
+            start_of_day_millis_with(date, |wall| tz.from_local_datetime(wall))
+        }
+    }
 }
 
-/// Core of [`local_start_of_day_millis`], parameterized over the timezone
+/// Core of [`start_of_day_millis`], parameterized over the timezone
 /// resolver so the DST-gap handling can be exercised deterministically in tests.
 ///
 /// Starts at midnight and, when that wall-clock time is skipped (a spring-forward
 /// gap), walks forward in 1-minute steps to the first representable instant. The
 /// probe window covers a full day so even unusual offsets resolve rather than
 /// silently dropping the boundary.
-fn start_of_day_millis_with<F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
+fn start_of_day_millis_with<Tz, F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
 where
-    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Local>>,
+    Tz: chrono::TimeZone,
+    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Tz>>,
 {
     let mut wall = date.and_hms_opt(0, 0, 0)?;
     for _ in 0..=(24 * 60) {
@@ -1643,7 +1666,11 @@ mod tests {
         // each message (and how `build_date_filter` derives these strings from
         // `chrono::Local::now()`).
         let day = "2026-03-08";
-        let (since, until) = parse_date_range(&Some(day.into()), &Some(day.into()));
+        let (since, until) = parse_date_range(
+            &Some(day.into()),
+            &Some(day.into()),
+            &tokscale_core::BucketTimezone::Local,
+        );
 
         let expected_since = Local
             .with_ymd_and_hms(2026, 3, 8, 0, 0, 0)

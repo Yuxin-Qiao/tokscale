@@ -2753,8 +2753,6 @@ struct HourAggregator {
 /// Derives the hour slot from `UnifiedMessage.timestamp` (Unix ms).
 /// Falls back to date + "00:00" when timestamp is zero or missing.
 pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, String> {
-    use chrono::{Local, TimeZone};
-
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -2781,13 +2779,18 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 
     let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
 
+    // The hour key embeds a date, and the timestamp-less fallback below builds
+    // one out of `msg.date` — which the rebucket pass has already moved to the
+    // pinned zone. Deriving the primary key from the host instead would let a
+    // single report disagree with itself about which day an hour belongs to.
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
     for msg in filtered {
         let hour_key = if msg.timestamp > 0 {
-            let ts_secs = msg.timestamp / 1000;
-            match Local.timestamp_opt(ts_secs, 0) {
-                chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:00").to_string(),
-                _ => format!("{} 00:00", msg.date),
-            }
+            bucket_timezone
+                .hour_key(msg.timestamp)
+                .unwrap_or_else(|| format!("{} 00:00", msg.date))
         } else {
             format!("{} 00:00", msg.date)
         };
