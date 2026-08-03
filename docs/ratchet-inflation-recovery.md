@@ -488,6 +488,38 @@ far smaller than the current failure — an hour twice a year, not a full re-spl
 on every rescan — but it is not zero, and calling this "the only exact fix"
 above is only true of the named-zone variant.
 
+### The size question, now measured (2026-08-03)
+
+Three release builds of `tokscale-cli`, same toolchain and host
+(aarch64-apple-darwin, `lto = true`, `codegen-units = 1`, `strip = true` — so
+these are shipped sizes, not pre-strip ones):
+
+| build | bytes | vs baseline |
+|---|---:|---:|
+| `origin/main` | 15,061,600 | — |
+| pinning + `chrono-tz` | 16,300,464 | **+1,238,864 (+1.18 MiB, +8.23%)** |
+| pinning + `FixedOffset` | 15,094,688 | +33,088 (+32 KiB, +0.22%) |
+
+The feature itself is ~32 KiB. Everything else — 1.15 MiB — is the tz database.
+
+**Shipped the named zone.** The 1.15 MiB is real and it lands on all nine
+targets, but it is the entire price of the phase being exact rather than
+approximate, and the phase exists specifically because approximate re-splitting
+is what inflates the totals. Two things settled it beyond the ratio:
+
+1. `chrono` already depends on `iana-time-zone` to implement `Local`, so
+   *detecting* the machine's zone name costs nothing. Only honoring it later
+   needs the database. Half the mechanism was already paid for.
+2. A fixed offset cannot be what the user configures. `tokscale config set
+   timezone Asia/Seoul` has to store something that survives a DST boundary; the
+   offset variant can only store `+09:00`, which is a different and worse
+   setting to ask someone to reason about after they relocate.
+
+Recorded for whoever revisits this: if the binary budget ever forces the offset
+variant, the sentence at the top of this phase — "the only exact fix" — stops
+being true, and the residual is usage within an hour of local midnight on the
+days following a DST transition.
+
 ## Phase 4 — Heal the daily rows
 
 For the day-level surfaces, and only if Phase 1's census says the tail justifies

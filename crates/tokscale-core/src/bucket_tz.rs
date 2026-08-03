@@ -156,8 +156,14 @@ mod tests {
 
     #[test]
     fn unset_and_blank_names_stay_unpinned() {
-        assert_eq!(BucketTimezone::from_pinned_name(None), BucketTimezone::Local);
-        assert_eq!(BucketTimezone::from_pinned_name(Some("")), BucketTimezone::Local);
+        assert_eq!(
+            BucketTimezone::from_pinned_name(None),
+            BucketTimezone::Local
+        );
+        assert_eq!(
+            BucketTimezone::from_pinned_name(Some("")),
+            BucketTimezone::Local
+        );
         assert_eq!(
             BucketTimezone::from_pinned_name(Some("   ")),
             BucketTimezone::Local

@@ -3749,7 +3749,10 @@ fn create_bucket_timezone_fixture_dir() -> TempDir {
     let session = base.join(".local/share/opencode/storage/message/session1");
     fs::create_dir_all(&session).unwrap();
 
-    for (id, created_ms) in [("msg_a", 1_772_451_000_000i64), ("msg_b", 1_772_474_400_000)] {
+    for (id, created_ms) in [
+        ("msg_a", 1_772_451_000_000i64),
+        ("msg_b", 1_772_474_400_000),
+    ] {
         let msg = format!(
             r#"{{
                 "id": "{id}",
@@ -3860,10 +3863,7 @@ fn test_unpinned_first_scan_still_buckets_by_the_host_timezone() {
     );
     assert_eq!(
         graph_day_buckets(seoul.path(), "Asia/Seoul"),
-        vec![
-            ("2026-03-02".to_string(), 1),
-            ("2026-03-03".to_string(), 1)
-        ],
+        vec![("2026-03-02".to_string(), 1), ("2026-03-03".to_string(), 1)],
         "an unpinned device must bucket by its own timezone, unchanged"
     );
 }
@@ -3880,10 +3880,7 @@ fn test_first_run_pins_the_host_timezone_without_changing_its_own_output() {
     let buckets = graph_day_buckets(tmp.path(), "Asia/Seoul");
     assert_eq!(
         buckets,
-        vec![
-            ("2026-03-02".to_string(), 1),
-            ("2026-03-03".to_string(), 1)
-        ],
+        vec![("2026-03-02".to_string(), 1), ("2026-03-03".to_string(), 1)],
         "the run that pins must report what it would have reported unpinned"
     );
 

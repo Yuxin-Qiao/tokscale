@@ -372,8 +372,10 @@ mod tests {
         // Kiritimati: 2026-03-03 01:30 and 08:00 — still one day, because both
         // turns cross together. Seoul is where they separate: 20:30 on the 2nd
         // and 03:00 on the 3rd.
-        let seoul =
-            parse_crush_sqlite_in(&db_path, &BucketTimezone::from_pinned_name(Some("Asia/Seoul")));
+        let seoul = parse_crush_sqlite_in(
+            &db_path,
+            &BucketTimezone::from_pinned_name(Some("Asia/Seoul")),
+        );
         assert_eq!(seoul.len(), 2, "Seoul splits the session across two days");
         assert_eq!(seoul[0].message_count, 1);
         assert_eq!(seoul[1].message_count, 1);
@@ -384,8 +386,10 @@ mod tests {
 
         // And the split is a function of the pin alone: the same call twice
         // returns the same shape regardless of what the host machine is set to.
-        let seoul_again =
-            parse_crush_sqlite_in(&db_path, &BucketTimezone::from_pinned_name(Some("Asia/Seoul")));
+        let seoul_again = parse_crush_sqlite_in(
+            &db_path,
+            &BucketTimezone::from_pinned_name(Some("Asia/Seoul")),
+        );
         assert_eq!(
             seoul.iter().map(|m| m.timestamp).collect::<Vec<_>>(),
             seoul_again.iter().map(|m| m.timestamp).collect::<Vec<_>>()

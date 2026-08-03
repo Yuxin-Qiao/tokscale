@@ -2887,7 +2887,8 @@ async fn generate_graph_with_loaded_pricing(
 
     let filtered = filter_messages_for_report(all_messages, &options);
 
-    let bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
 
     build_graph_from_messages(
         filtered,
