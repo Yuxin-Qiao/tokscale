@@ -505,23 +505,25 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
 });
 
 describe("isDeviceClientTotalsWriteEnabled", () => {
-  it("defaults to enabled when the flag is unset", () => {
-    expect(isDeviceClientTotalsWriteEnabled({})).toBe(true);
+  it("defaults to disabled when the flag is unset", () => {
+    expect(isDeviceClientTotalsWriteEnabled({})).toBe(false);
   });
 
-  it("is killable without a deploy or a migration revert", () => {
-    for (const value of ["0", "false", "off", "no", "FALSE", " off "]) {
-      expect(
-        isDeviceClientTotalsWriteEnabled({ [DEVICE_CLIENT_TOTALS_WRITE_FLAG]: value })
-      ).toBe(false);
-    }
-  });
-
-  it("stays enabled for any other value", () => {
-    for (const value of ["1", "true", "on", ""]) {
+  it("is opt-in without a deploy or a migration revert", () => {
+    for (const value of ["1", "true", "on", "yes", "TRUE", " on "]) {
       expect(
         isDeviceClientTotalsWriteEnabled({ [DEVICE_CLIENT_TOTALS_WRITE_FLAG]: value })
       ).toBe(true);
+    }
+  });
+
+  // Empty string and near-misses stay OFF on purpose: an unset-looking or
+  // mistyped value must not silently turn the write on.
+  it("stays disabled for anything that is not an explicit yes", () => {
+    for (const value of ["0", "false", "off", "no", "", "yep", "enable"]) {
+      expect(
+        isDeviceClientTotalsWriteEnabled({ [DEVICE_CLIENT_TOTALS_WRITE_FLAG]: value })
+      ).toBe(false);
     }
   });
 });

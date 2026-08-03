@@ -155,7 +155,11 @@ const flagName = "TOKSCALE_DEVICE_CLIENT_TOTALS_WRITE";
 
 beforeEach(() => {
   mockState.reset();
-  delete process.env[flagName];
+  // The census now defaults OFF so it cannot add latency to `POST /api/submit`
+  // by accident (see the flag's doc comment). These tests exercise the census
+  // itself, so they opt in explicitly rather than depending on the production
+  // default — which is what a test asserting placement should do anyway.
+  process.env[flagName] = "1";
 });
 
 afterEach(() => {

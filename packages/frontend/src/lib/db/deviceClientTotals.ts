@@ -27,17 +27,25 @@ import { clientContributionToBreakdownData } from "./helpers";
 export const DEVICE_CLIENT_TOTALS_BUCKET_WIDTH = "month";
 
 /**
- * Kill switch. The migration is effectively irreversible (drizzle stores the
- * content hash of an applied migration), but the WRITE need not inherit that:
- * setting `TOKSCALE_DEVICE_CLIENT_TOTALS_WRITE` to `0`/`false`/`off` disables
- * it in seconds without reverting a migration or shipping a rollback.
+ * Rollout switch, default OFF.
  *
- * Default is ENABLED — the flag exists to switch a misbehaving write off, not
- * to gate it on.
+ * The migration is effectively irreversible — drizzle stores the content hash
+ * of an applied migration — but the WRITE need not inherit that, and this flag
+ * moves it in either direction without a deploy or a migration revert.
+ *
+ * An earlier draft defaulted this ON, on the reasoning that the flag existed to
+ * switch a misbehaving write off rather than to gate it on. Review pushed back
+ * and was right: `recordRatchetCensus` is awaited on `POST /api/submit`, so
+ * defaulting it on makes every submit pay two extra database round-trips from
+ * the moment this deploys — for a value nothing reads and only the log keeps.
+ * The added p50/p95 has not been measured. A census that slows down the thing
+ * it is measuring is not worth having on by accident.
+ *
+ * Opt in with `=1` once that latency is known.
  */
 export const DEVICE_CLIENT_TOTALS_WRITE_FLAG = "TOKSCALE_DEVICE_CLIENT_TOTALS_WRITE";
 
-const DISABLED_FLAG_VALUES = new Set(["0", "false", "off", "no"]);
+const ENABLED_FLAG_VALUES = new Set(["1", "true", "on", "yes"]);
 
 /**
  * PostgreSQL caps a statement at 65,535 bound parameters. Each row binds 7,
@@ -86,8 +94,8 @@ export function isDeviceClientTotalsWriteEnabled(
   env: Record<string, string | undefined> = process.env
 ): boolean {
   const raw = env[DEVICE_CLIENT_TOTALS_WRITE_FLAG];
-  if (raw == null) return true;
-  return !DISABLED_FLAG_VALUES.has(raw.trim().toLowerCase());
+  if (raw == null) return false;
+  return ENABLED_FLAG_VALUES.has(raw.trim().toLowerCase());
 }
 
 /**
