@@ -17,6 +17,14 @@ import {
   mergeTimestampMs,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
+import {
+  buildDualDerivationRecord,
+  foldContributionsIntoBuckets,
+  isDeviceClientTotalsWriteEnabled,
+  readHighwaterTotal,
+  recordDeviceClientTotals,
+  DUAL_DERIVATION_LOG_PREFIX,
+} from "@/lib/db/deviceClientTotals";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
 import { LEGACY_DEVICE_KEY } from "@/lib/devices/shared";
@@ -210,6 +218,63 @@ function mergeActiveTimeMs(
   if (existing == null) return incoming ?? null;
   if (incoming == null) return existing;
   return Math.max(existing, incoming);
+}
+
+/**
+ * Phase 1 + Phase 1.5 of docs/ratchet-inflation-recovery.md.
+ *
+ * Populates the per-device/client/bucket high-water table and records a
+ * measurement. **This changes no value served to the caller** — it runs after
+ * the response payload has already been computed, and its return value is
+ * discarded.
+ *
+ * Placement is the whole point. The submit path above is one `db.transaction`
+ * holding `.for('update')` on the submissions row, which serializes a user's
+ * submits across every device until commit. A defect in a write placed there
+ * fails the user's submission — "nothing reads it" is no protection. Because
+ * the write is a `GREATEST` upsert it is idempotent, so running it after
+ * commit downgrades any failure from a rejected submission to one deferred
+ * measurement, which the next submit repairs. The cost is that the table can
+ * lag the daily rows by one submit, which is why a missing bucket must read as
+ * UNKNOWN and never as zero.
+ *
+ * Every failure mode is swallowed here on purpose.
+ */
+async function recordRatchetCensus(params: {
+  userId: string;
+  submissionId: string;
+  submittedDeviceId: string;
+  contributions: SubmissionData["contributions"];
+  origin: "cli" | "backfill";
+  servedTokens: number;
+  servedCost: number;
+}): Promise<void> {
+  if (!isDeviceClientTotalsWriteEnabled()) return;
+
+  try {
+    const buckets = foldContributionsIntoBuckets(params.contributions, params.origin);
+    await recordDeviceClientTotals({
+      executor: db,
+      submittedDeviceId: params.submittedDeviceId,
+      buckets,
+    });
+
+    // Phase 1.5: derive the total the OTHER way and record the pair. The value
+    // already served came from SUM(daily_breakdown.tokens) and is untouched.
+    const highwater = await readHighwaterTotal({ executor: db, userId: params.userId });
+    const record = buildDualDerivationRecord({
+      userId: params.userId,
+      submissionId: params.submissionId,
+      servedTokens: params.servedTokens,
+      servedCost: params.servedCost,
+      highwater,
+    });
+    console.log(`${DUAL_DERIVATION_LOG_PREFIX} ${JSON.stringify(record)}`);
+  } catch (e) {
+    // A deferred measurement, not a failed submission. The upsert is
+    // idempotent, so the next submit from this device repairs the gap.
+    console.error("Ratchet census write failed (submission unaffected):", e);
+  }
 }
 
 /**
@@ -915,6 +980,7 @@ export async function POST(request: Request) {
 
       return {
         submissionId,
+        submittedDeviceId: submittedDevice.id,
         isNewSubmission,
         metrics: {
           totalTokens: aggregates.totalTokens,
@@ -927,6 +993,18 @@ export async function POST(request: Request) {
           clients: Array.from(allClients),
         },
       };
+    });
+
+    // Phase 1 / 1.5 census. Deliberately after the transaction commits, and
+    // deliberately unable to affect the response below.
+    await recordRatchetCensus({
+      userId: tokenRecord.userId,
+      submissionId: result.submissionId,
+      submittedDeviceId: result.submittedDeviceId,
+      contributions: data.contributions,
+      origin: isBackfill ? "backfill" : "cli",
+      servedTokens: result.metrics.totalTokens,
+      servedCost: result.metrics.totalCost,
     });
 
     const usernameCacheKey = normalizeUsernameCacheKey(tokenRecord.username);

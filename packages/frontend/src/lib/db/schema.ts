@@ -13,6 +13,7 @@ import {
   index,
   unique,
   uniqueIndex,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 import {
@@ -388,6 +389,103 @@ export const dailyBreakdownRelations = relations(dailyBreakdown, ({ one }) => ({
 }));
 
 // ============================================================================
+// SUBMITTED DEVICE CLIENT TOTALS (ratchet-inflation census, Phase 1)
+// ============================================================================
+/**
+ * Per-device, per-client, per-bucket token/cost HIGH-WATER marks.
+ *
+ * Phase 1 of docs/ratchet-inflation-recovery.md. **Nothing reads this table.**
+ * It exists so the inflation that `SUM(daily_breakdown.tokens)` accumulates can
+ * be measured against a bucket-level high-water reconstruction of the same
+ * history, on live traffic, before any read path is switched over (Phase 2).
+ *
+ * Merge semantics: `GREATEST` on conflict, mirroring the per-device session
+ * metrics on `submitted_devices`. A `--clients`/`--date` filtered submit
+ * reports only a slice of a bucket and must never lower the stored value.
+ *
+ * **This table must never be backfilled from `daily_breakdown`.** Seeding
+ * `tokens_highwater` with `SUM(daily in bucket)` would seed it with the
+ * INFLATED value; a later truthful full scan reports the true, lower total and
+ * `GREATEST(inflated, true)` keeps the inflated one permanently. The table
+ * starts empty and is filled only by incoming payloads — the warm-up is forced
+ * by the merge semantics, not a convenience to optimise away.
+ *
+ * `origin` is part of the primary key and is load-bearing. `getSubmitDevice`
+ * in the submit route falls back to `LEGACY_SUBMIT_DEVICE_KEY` when a payload
+ * omits `device`, so a `tokscale import` backfill and a legacy CLI submit land
+ * on the SAME `submitted_devices` row. Keyed without origin, `GREATEST` would
+ * take the max of imported and locally-scanned history instead of their sum,
+ * silently dropping whichever is smaller.
+ *
+ * KNOWN, and deliberately not fixed here — Phase 2 inherits it. The submit
+ * route's legacy-adoption path re-parents a user's `daily_breakdown` rows from
+ * the LEGACY device to their first device-aware device, so those days are
+ * counted once. This table has no equivalent re-parenting: a user who submits
+ * from a legacy CLI and later from a device-aware one ends up with the same
+ * history recorded under BOTH device ids, so a naive
+ * `SUM(tokens_highwater)` over their devices double-counts it. Phase 1 is
+ * inert so nothing is wrong today, and Phase 1.5 is exactly what surfaces it —
+ * those accounts show a served/high-water ratio near 0.5. Phase 2 must handle
+ * it (adopt the rows the same way, or aggregate per user+client+bucket)
+ * BEFORE it reads from here.
+ *
+ * Column types are chosen deliberately (see the `LEAST(...)` clamps in the
+ * submit route): `tokens_highwater` is bigint because a bucket total is a sum
+ * of day totals, and any aggregate reading it back must clamp before casting.
+ * `cost_highwater` is numeric(18,4) — wider than `daily_breakdown.cost`'s
+ * numeric(14,4), so a month-wide sum of day costs that already fit the
+ * narrower column cannot overflow this one.
+ */
+export const submittedDeviceClientTotals = pgTable(
+  "submitted_device_client_totals",
+  {
+    submittedDeviceId: uuid("submitted_device_id")
+      .notNull()
+      .references(() => submittedDevices.id, { onDelete: "cascade" }),
+    /** Canonical client id (post alias normalization, e.g. "kilo" not "kilocode"). */
+    client: varchar("client", { length: 128 }).notNull(),
+    /** "cli" for locally-scanned usage, "backfill" for `tokscale import`. */
+    origin: varchar("origin", { length: 16 }).notNull(),
+    /** Only "month" is written today; the column keeps Phase 3 open. */
+    bucketWidth: varchar("bucket_width", { length: 8 }).notNull(),
+    /** Stable bucket label: `YYYY-MM` for bucket_width = "month". */
+    bucketKey: varchar("bucket_key", { length: 16 }).notNull(),
+
+    tokensHighwater: bigint("tokens_highwater", { mode: "number" })
+      .notNull()
+      .default(0),
+    costHighwater: decimal("cost_highwater", { precision: 18, scale: 4 })
+      .notNull()
+      .default("0"),
+
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.submittedDeviceId,
+        table.client,
+        table.origin,
+        table.bucketWidth,
+        table.bucketKey,
+      ],
+    }),
+  ]
+);
+
+export const submittedDeviceClientTotalsRelations = relations(
+  submittedDeviceClientTotals,
+  ({ one }) => ({
+    submittedDevice: one(submittedDevices, {
+      fields: [submittedDeviceClientTotals.submittedDeviceId],
+      references: [submittedDevices.id],
+    }),
+  })
+);
+
+// ============================================================================
 // GROUPS
 // ============================================================================
 export const groupRoles = ["owner", "admin", "member"] as const;
@@ -601,6 +699,8 @@ export type SubmittedDevice = typeof submittedDevices.$inferSelect;
 export type NewSubmittedDevice = typeof submittedDevices.$inferInsert;
 export type DailyBreakdown = typeof dailyBreakdown.$inferSelect;
 export type NewDailyBreakdown = typeof dailyBreakdown.$inferInsert;
+export type SubmittedDeviceClientTotal = typeof submittedDeviceClientTotals.$inferSelect;
+export type NewSubmittedDeviceClientTotal = typeof submittedDeviceClientTotals.$inferInsert;
 export type Group = typeof groups.$inferSelect;
 export type NewGroup = typeof groups.$inferInsert;
 export type GroupMember = typeof groupMembers.$inferSelect;
