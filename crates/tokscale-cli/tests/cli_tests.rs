@@ -4002,7 +4002,7 @@ fn test_first_run_never_rebuckets_when_the_detector_disagrees_with_local() {
     );
 }
 
-/// Hour keys that actually carry messages, in the order the report emits them.
+/// Hour keys that actually carry messages, sorted ascending.
 fn hourly_keys(base: &Path, timezone: &str) -> Vec<String> {
     let output = cmd_with_home(base)
         .env("TZ", timezone)
@@ -4127,7 +4127,9 @@ fn test_config_set_refuses_to_overwrite_unreadable_settings() {
         .args(["config", "set", "timezone", "Asia/Seoul"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("could not be read"));
+        .stderr(predicate::str::contains(
+            "could not read this machine's tokscale settings",
+        ));
 
     assert_eq!(
         fs::read_to_string(&settings_path).unwrap(),

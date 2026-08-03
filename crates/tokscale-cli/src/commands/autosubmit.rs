@@ -2469,19 +2469,26 @@ mod tests {
             since
         }
 
+        let kiritimati_zone =
+            tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"));
+        // Bracket the call: `submit_filters` reads the clock itself, so a date
+        // sampled only afterwards would disagree with it across a rollover.
+        let before = kiritimati_zone.today();
         let kiritimati = today_for_pinned_zone("Pacific/Kiritimati");
+        let after = kiritimati_zone.today();
+
         let niue = today_for_pinned_zone("Pacific/Niue");
 
-        assert_eq!(
-            kiritimati.as_deref(),
-            Some(
-                tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"))
-                    .today()
-                    .format("%Y-%m-%d")
-                    .to_string()
-                    .as_str()
-            ),
-            "autosubmit must resolve today in the pinned zone, not the host's"
+        let acceptable: Vec<String> = [before, after]
+            .iter()
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .collect();
+        assert!(
+            kiritimati
+                .as_deref()
+                .is_some_and(|day| acceptable.iter().any(|expected| expected == day)),
+            "autosubmit must resolve today in the pinned zone, not the host's — \
+             got {kiritimati:?}, expected one of {acceptable:?}"
         );
         assert_ne!(
             kiritimati, niue,

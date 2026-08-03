@@ -548,12 +548,11 @@ mod tests {
         let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
 
         let now = chrono::Utc::now().timestamp_millis();
-        const YEAR: i64 = 365 * 24 * 60 * 60 * 1000;
 
         // The premise: indistinguishable across the window this check used to
         // sample. If this ever stops holding the test below proves nothing.
         assert!(
-            zones_agree_between(&seoul, &tokyo, now - 10 * YEAR, now + YEAR),
+            zones_agree_between(&seoul, &tokyo, now - 10 * YEAR_MS, now + YEAR_MS),
             "Seoul and Tokyo must be indistinguishable over the last decade for \
              this test to be about the window rather than the zones"
         );

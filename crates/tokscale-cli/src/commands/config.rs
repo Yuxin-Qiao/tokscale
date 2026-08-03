@@ -129,9 +129,13 @@ pub fn run_list() -> Result<()> {
 fn load_for_write() -> Result<Settings> {
     let (settings, origin) = Settings::load_with_origin();
     if !origin.is_safe_to_overwrite() {
+        // Deliberately does not name settings.json: this also fires when the
+        // config *directory* cannot be resolved or created, where there is no
+        // file to fix or remove and telling someone to delete one is a dead end.
         bail!(
-            "settings.json exists but could not be read, so writing it would replace \
-             every other setting in it with a default. Fix or remove the file first."
+            "could not read this machine's tokscale settings, so writing them would \
+             replace every setting with a default. Check that the config directory \
+             is readable and writable, and that settings.json in it is valid JSON."
         );
     }
     Ok(settings)
