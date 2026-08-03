@@ -4135,3 +4135,60 @@ fn test_config_set_refuses_to_overwrite_unreadable_settings() {
         "a refused write must leave the file untouched"
     );
 }
+
+/// A `bucketTimezone` that does not name a zone the tz database knows is not a
+/// pin: bucketing degrades to host-local, so the device keeps exactly the
+/// exposure auto-pinning exists to close. Treating "present" as "pinned" made
+/// one bad hand edit suppress the fix permanently.
+#[test]
+fn test_auto_pinning_recovers_from_a_bucket_timezone_that_names_no_zone() {
+    let pinned_zone = |base: &Path| -> String {
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(base.join(".config/tokscale/settings.json")).unwrap(),
+        )
+        .unwrap();
+        settings["scanner"]["bucketTimezone"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let scan = |base: &Path| {
+        cmd_with_home(base)
+            .env("TZ", "Asia/Seoul")
+            .args(["graph", "--client", "opencode", "--no-spinner"])
+            .assert()
+            .success();
+    };
+
+    // What a real recovery looks like on this host, from a file that is simply
+    // unpinned. Comparing against it keeps the test from passing on a host
+    // where nothing can be detected and every case recovers to nothing.
+    let baseline = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone_field(baseline.path(), "null");
+    scan(baseline.path());
+    let detected = pinned_zone(baseline.path());
+    assert!(
+        !detected.is_empty(),
+        "auto-pinning must work on this host for the assertions below to mean \
+         anything"
+    );
+
+    for junk in ["", "   ", "Mars/Olympus_Mons", "+09:00"] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        pin_bucket_timezone(tmp.path(), junk);
+
+        scan(tmp.path());
+        assert_eq!(
+            pinned_zone(tmp.path()),
+            detected,
+            "`{junk}` names no zone, so bucketing already falls back to the host \
+             — the next run must re-detect instead of leaving the device \
+             permanently unpinned"
+        );
+
+        // And the recovered value is a real pin, so it is not re-detected again
+        // on every subsequent run.
+        scan(tmp.path());
+        assert_eq!(pinned_zone(tmp.path()), detected);
+    }
+}

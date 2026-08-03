@@ -337,7 +337,7 @@ pub fn pin_bucket_timezone_if_unset(home_dir: &Option<String>) {
         return;
     }
 
-    if settings.scanner.bucket_timezone.is_some() {
+    if tokscale_core::BucketTimezone::from_scanner_settings(&settings.scanner).is_pinned() {
         return;
     }
 
