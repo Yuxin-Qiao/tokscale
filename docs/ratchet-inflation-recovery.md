@@ -541,9 +541,9 @@ not, because the platform difference *is* the bug.
 The fix is not "use the other source". Either source can be wrong, and a future
 platform can disagree in a new way. The fix is to stop trusting the name and
 verify it: a candidate is pinned only if its UTC offset matches `chrono::Local`
-at every sampled instant across an eleven-year window. If it disagrees anywhere,
-nothing is written and the device stays unpinned — which is its previous
-behaviour, and therefore always safe.
+at every sampled instant across the window. If it disagrees anywhere, nothing is
+written and the device stays unpinned — which is its previous behaviour, and
+therefore always safe.
 
 That turns the guarantee from "two crates presumably agree" into something
 structural: **the recorded zone produces the same day keys as the zone the device
@@ -554,14 +554,45 @@ value, not on its provenance.
 The sampling step is set by what the tz database can express rather than by
 taste: DST offsets move in whole or half hours, and the tightest real case is a
 30-minute shift (`Australia/Lord_Howe` against `Australia/Sydney`), so a
-6-hour step would have stepped straight over it. 192,721 lookups, 11.4 ms
-release, once per scan while unpinned.
+6-hour step would have stepped straight over it.
 
 **Generalisable:** any time a value is derived from the environment by two
 different libraries, the invariant to test is that they agree — not that either
 one is correct. And measure the real call: benchmarking `zones_agree` between two
 `chrono-tz` zones read 30% low, because `chrono::Local` re-checks `TZ` on every
 lookup and the proxy had no `Local` in it.
+
+### A sampled *window* has the same defect as a coarse *step* (2026-08-03)
+
+The check above shipped with a window of ten years back and one year ahead, and
+that window has exactly the flaw the 6-hour step had, one level up. Two zones can
+share today's rules and still differ in older ones — `America/New_York` and
+`America/Toronto` diverged over the 1974-75 US emergency DST; `Asia/Seoul` and
+`Asia/Tokyo` over Seoul's 1987-88 DST — so a candidate can pass a decade of
+samples and still move day boundaries in older history. And `rebucket_days`
+applies an accepted pin to *every* message, not only recent ones.
+
+So the invariant "pinning never changes existing bucketing" was being asserted
+over a slice of the range it applies to. The fix is the same shape as before:
+make the checked range cover everything that can be re-keyed. The window now runs
+from the Unix epoch to ten years ahead, and the rebucket passes decline to move a
+message whose timestamp is not strictly positive — that value is the parsers'
+"no usable time" sentinel, not an instant before 1970 — so the epoch is a real
+lower bound rather than a convenient one. 1,167,280 lookups, **56 ms** release
+(up from 11.4 ms), once per scan while unpinned and never again after.
+
+The wider window rejects more, including the case where the host's zoneinfo and
+the bundled `chrono-tz` database disagree on an old rule for the *same* zone
+name. That is the safe direction: declining leaves the device bucketing by
+`chrono::Local`, carrying a bug it already had, while accepting wrongly rewrites
+history that is already on the server behind a monotonic guard which makes the
+result permanent.
+
+**Generalisable:** when a check samples, it has two resolutions — how finely it
+samples, and how far. Getting the step right and leaving the window short buys
+nothing, because a claim about all of history cannot be supported by a sample of
+part of it. Either cover the whole range the claim applies to, or narrow the
+claim to the range you covered.
 
 ## Phase 4 — Heal the daily rows
 

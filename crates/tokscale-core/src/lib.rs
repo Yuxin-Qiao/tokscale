@@ -4009,7 +4009,11 @@ fn rebucket_parsed_days(
     }
 
     for message in messages.iter_mut() {
-        // See `UnifiedMessage::rebucket_date` for why an empty key is kept out.
+        // See `UnifiedMessage::rebucket_date` for why a non-positive timestamp
+        // and an empty key are both kept out.
+        if message.timestamp <= 0 {
+            continue;
+        }
         let key = timezone.day_key(message.timestamp);
         if !key.is_empty() {
             message.date = key;

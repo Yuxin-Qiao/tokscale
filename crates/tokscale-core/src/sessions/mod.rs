@@ -391,6 +391,16 @@ impl UnifiedMessage {
     /// post-parse pass that holds the user's settings re-key every message at
     /// once, which is the only place the pinned zone is actually known.
     pub(crate) fn rebucket_date(&mut self, timezone: &crate::bucket_tz::BucketTimezone) {
+        // A non-positive timestamp is the parsers' "no usable time" sentinel,
+        // not an instant before 1970. Re-keying it would move garbage between
+        // two equally wrong days, and it is also what bounds the window the
+        // auto-pin agreement check has to cover: leaving these alone is what
+        // makes `AGREEMENT_WINDOW_START_MS` a real lower bound rather than a
+        // convenient one.
+        if self.timestamp <= 0 {
+            return;
+        }
+
         let key = timezone.day_key(self.timestamp);
         // An unrepresentable instant yields an empty key. Keeping the previous
         // date is wrong by at most the offset between two zones; replacing it

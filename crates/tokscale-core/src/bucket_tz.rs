@@ -225,25 +225,78 @@ fn tz_env_zone() -> Option<chrono_tz::Tz> {
     name.parse::<chrono_tz::Tz>().ok()
 }
 
+/// Approximate milliseconds in a year. Only used to size the forward edge of
+/// the agreement window, where a year either way is immaterial.
+const YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+/// The first instant [`zones_agree`] checks: the Unix epoch.
+///
+/// Every day key in tokscale is derived from a `timestamp` field holding Unix
+/// milliseconds, and the rebucket passes decline to move a message whose
+/// timestamp is not strictly positive (see `UnifiedMessage::rebucket_date`) —
+/// that value is the parsers' "no timestamp" sentinel, not a real instant. So
+/// the epoch is not a convenient cut-off: it is a lower bound on every instant
+/// auto-pinning can actually re-key.
+pub(crate) const AGREEMENT_WINDOW_START_MS: i64 = 0;
+
+/// How far past "now" [`zones_agree`] checks.
+///
+/// Timestamps ahead of the clock come from clock skew or a corrupt file rather
+/// than from history, so this only has to be comfortably beyond anything a
+/// scan will meet before the next release re-runs the check.
+pub(crate) const AGREEMENT_WINDOW_AHEAD_MS: i64 = 10 * YEAR_MS;
+
+// The window's reach *is* the safety claim, so hold it here rather than leaving
+// it to two constants nobody re-reads. Narrowing either edge means the pin can
+// be accepted for instants nobody checked.
+const _: () = assert!(
+    AGREEMENT_WINDOW_START_MS == 0,
+    "the rebucket passes skip non-positive timestamps, so the window must start \
+     at the epoch to cover every instant they do move"
+);
+const _: () = assert!(
+    AGREEMENT_WINDOW_AHEAD_MS >= 5 * YEAR_MS,
+    "the forward edge must stay well past any clock skew a scan will meet"
+);
+
 /// Whether two zones are observationally identical for bucketing purposes.
 ///
 /// Day keys depend on a zone only through its UTC offset, so two zones that
 /// agree on offset at every instant produce identical buckets and are
 /// interchangeable here — `Etc/UTC` and `UTC`, or `America/New_York` and
-/// `America/Toronto`. Anything that differs anywhere in the sampled window
-/// would move a day boundary, and is rejected.
+/// `America/Toronto`. Anything that differs anywhere in the window would move a
+/// day boundary, and is rejected.
 ///
-/// Sampled rather than proven, at a density chosen by measurement rather than
-/// by feel: every 30 minutes from 10 years back to 1 year ahead. That is
-/// 192,721 offset lookups, timed on Linux at **11.4 ms** release / 65 ms debug
-/// for a full accepting pass against `chrono::Local`. It runs once per scan
-/// while nothing is pinned, and never again after. A rejecting pass is far
-/// cheaper: a wholly different zone is caught on the first probe.
+/// # Why the window starts at the epoch
 ///
-/// (Measured against `chrono::Local` specifically, not against another
-/// `chrono-tz` zone — `Local` re-checks the `TZ` environment variable on every
-/// lookup, which a `chrono-tz`-to-`chrono-tz` benchmark does not capture and
-/// which made an earlier proxy measurement read ~30% low.)
+/// The claim auto-pinning rests on is "pinning never changes existing
+/// bucketing". A window that reaches back a fixed number of years cannot
+/// support that claim: two zones can match across recent rules and still differ
+/// in older ones, and `rebucket_days` applies an accepted pin to *every*
+/// message, including one older than the window. That is the same defect as
+/// sampling too coarsely, one level up — and the fix is the same shape, which
+/// is to make the checked range cover everything that can be re-keyed rather
+/// than a sample of it.
+///
+/// So the window runs from [`AGREEMENT_WINDOW_START_MS`] — the Unix epoch, the
+/// lower bound on any instant the rebucket passes will move — to ten years
+/// ahead. Nothing auto-pinning can re-key falls outside it.
+///
+/// # What the wider window costs
+///
+/// It rejects more. Two zones that share today's rules but split in the 1970s
+/// or 1980s no longer pass — `America/New_York` and `America/Toronto` diverged
+/// over the 1974-75 US emergency DST, `Asia/Seoul` and `Asia/Tokyo` over
+/// Seoul's 1987-88 DST — and if the host's zoneinfo and the bundled `chrono-tz`
+/// database ever disagree on an old rule for the *same* zone name, this
+/// declines to pin at all.
+///
+/// That is the safe direction to be wrong in. Declining leaves the device
+/// exactly where it was: bucketing by `chrono::Local`, carrying a bug it
+/// already had. Accepting wrongly rewrites history that is already on the
+/// server, behind a monotonic guard that makes the result permanent.
+///
+/// # Why sampling at 30 minutes is enough inside the window
 ///
 /// The step has to be smaller than the shortest interval over which two
 /// plausible zones can disagree. DST offsets move in whole or half hours, and
@@ -252,23 +305,41 @@ fn tz_env_zone() -> Option<chrono_tz::Tz> {
 /// transition. A coarser step would not: at 6 hours, two zones whose
 /// transitions differ by an hour would look identical.
 ///
-/// What remains uncovered is history older than the window. Two zones that
-/// agree across eleven years of samples but diverged before that are the same
-/// zone or an alias for every practical purpose.
+/// # Cost
+///
+/// 1,167,280 offset lookups for a full accepting pass against `chrono::Local`,
+/// measured at **56 ms** release / 786 ms debug (up from 11.4 ms / 136 ms for
+/// the old 10-years-back window). It runs once per scan while nothing is
+/// pinned, and never again after the first run records a zone. A rejecting pass
+/// is far cheaper: a wholly different zone is caught on the first probe.
+///
+/// (Measured against `chrono::Local` specifically, not against another
+/// `chrono-tz` zone — `Local` re-checks the `TZ` environment variable on every
+/// lookup, which a `chrono-tz`-to-`chrono-tz` benchmark does not capture and
+/// which made an earlier proxy measurement read ~30% low.)
 fn zones_agree<A, B>(candidate: &A, reference: &B) -> bool
 where
     A: TimeZone,
     B: TimeZone,
 {
+    zones_agree_between(
+        candidate,
+        reference,
+        AGREEMENT_WINDOW_START_MS,
+        chrono::Utc::now().timestamp_millis() + AGREEMENT_WINDOW_AHEAD_MS,
+    )
+}
+
+/// [`zones_agree`] over an explicit range, so the window can be varied in tests.
+fn zones_agree_between<A, B>(candidate: &A, reference: &B, start_ms: i64, end_ms: i64) -> bool
+where
+    A: TimeZone,
+    B: TimeZone,
+{
     const STEP_MS: i64 = 30 * 60 * 1000;
-    const YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
-    let now = chrono::Utc::now().timestamp_millis();
-    let start = now - 10 * YEAR_MS;
-    let end = now + YEAR_MS;
-
-    let mut at = start;
-    while at <= end {
+    let mut at = start_ms;
+    while at <= end_ms {
         if offset_seconds(candidate, at) != offset_seconds(reference, at) {
             return false;
         }
@@ -393,10 +464,16 @@ mod tests {
         assert!(zones_agree(&utc, &"UTC".parse::<chrono_tz::Tz>().unwrap()));
 
         // Same rules, different names — a device may legitimately be detected
-        // as either and neither moves a day boundary.
+        // as either and neither moves a day boundary. These are tz database
+        // *links*, so they are the same rules by construction rather than by
+        // two zones happening to have matched recently.
         let new_york: chrono_tz::Tz = "America/New_York".parse().unwrap();
-        let toronto: chrono_tz::Tz = "America/Toronto".parse().unwrap();
-        assert!(zones_agree(&new_york, &toronto));
+        let us_eastern: chrono_tz::Tz = "US/Eastern".parse().unwrap();
+        assert!(zones_agree(&new_york, &us_eastern));
+
+        let seoul: chrono_tz::Tz = "Asia/Seoul".parse().unwrap();
+        let rok: chrono_tz::Tz = "ROK".parse().unwrap();
+        assert!(zones_agree(&seoul, &rok));
     }
 
     /// The guard that keeps the first run from re-keying history.
@@ -419,8 +496,18 @@ mod tests {
 
         // And against a fixed offset, which is what a `TZ=<+09>-9` host looks
         // like to `chrono::Local`: same offset now, no transitions ever.
-        let fixed_seoul = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
-        assert!(zones_agree(&seoul, &fixed_seoul), "Asia/Seoul has no DST");
+        // Tokyo, not Seoul — Seoul observed DST in 1987-88, and the window now
+        // reaches back far enough to see it.
+        let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
+        let plus_nine = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert!(
+            zones_agree(&tokyo, &plus_nine),
+            "Asia/Tokyo has had no DST since the epoch"
+        );
+        assert!(
+            !zones_agree(&seoul, &plus_nine),
+            "Asia/Seoul's 1987-88 DST is inside the window and must be seen"
+        );
         assert!(
             !zones_agree(&london, &chrono::FixedOffset::east_opt(0).unwrap()),
             "a fixed offset cannot stand in for a zone that observes DST"
@@ -430,11 +517,51 @@ mod tests {
         // where Sydney shifts by an hour, so for part of each DST season they
         // differ by only half an hour. A step coarser than that would step over
         // the divergence and accept two zones that bucket differently.
+        //
+        // Asserted over a recent window as well as the full one: across all of
+        // history these two diverge in bigger ways too, and the point here is
+        // that the *current* half-hour difference is still caught.
         let lord_howe: chrono_tz::Tz = "Australia/Lord_Howe".parse().unwrap();
         let sydney: chrono_tz::Tz = "Australia/Sydney".parse().unwrap();
         assert!(
             !zones_agree(&lord_howe, &sydney),
             "a half-hour DST difference must be detected"
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            !zones_agree_between(&lord_howe, &sydney, now - 2 * YEAR_MS, now),
+            "and detected from recent samples alone, not only from old history"
+        );
+    }
+
+    /// The window has to cover everything an accepted pin can re-key, not a
+    /// recent slice of it.
+    ///
+    /// `rebucket_days` applies the pin to *every* message, so a zone that
+    /// matches `chrono::Local` across the last decade but diverges in older
+    /// rules would still move day boundaries in older history. Seoul and Tokyo
+    /// are exactly that pair: both fixed at UTC+09:00 for decades, but Seoul
+    /// observed DST in 1987 and 1988 and Tokyo did not.
+    #[test]
+    fn zones_that_only_diverge_before_the_last_decade_are_still_rejected() {
+        let seoul: chrono_tz::Tz = "Asia/Seoul".parse().unwrap();
+        let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        const YEAR: i64 = 365 * 24 * 60 * 60 * 1000;
+
+        // The premise: indistinguishable across the window this check used to
+        // sample. If this ever stops holding the test below proves nothing.
+        assert!(
+            zones_agree_between(&seoul, &tokyo, now - 10 * YEAR, now + YEAR),
+            "Seoul and Tokyo must be indistinguishable over the last decade for \
+             this test to be about the window rather than the zones"
+        );
+
+        assert!(
+            !zones_agree(&seoul, &tokyo),
+            "a divergence older than the previous window must still be caught — \
+             Seoul's 1987-88 DST moves day boundaries the pin would silently rewrite"
         );
     }
 
