@@ -40,7 +40,7 @@ pub fn run_get(key: &str) -> Result<()> {
 
 pub fn run_set(key: &str, value: &str) -> Result<()> {
     let key = normalize_key(key)?;
-    let mut settings = Settings::load();
+    let mut settings = load_for_write()?;
 
     match key {
         "timezone" => {
@@ -80,7 +80,7 @@ pub fn run_set(key: &str, value: &str) -> Result<()> {
 
 pub fn run_unset(key: &str) -> Result<()> {
     let key = normalize_key(key)?;
-    let mut settings = Settings::load();
+    let mut settings = load_for_write()?;
 
     match key {
         "timezone" => {
@@ -116,6 +116,25 @@ pub fn run_list() -> Result<()> {
     println!("{:<12} {}", "timezone", timezone);
 
     Ok(())
+}
+
+/// Load settings for a command that is going to write them straight back.
+///
+/// `Settings::load()` answers an unparseable settings.json with
+/// `Settings::default()`, so saving after it would replace a file we could not
+/// read with defaults we invented — losing scanner paths, aliases, autosubmit
+/// config and UI preferences to fix one field. `tokscale config` is a
+/// deliberate, interactive command, so it says so and stops instead of guessing
+/// which is worse.
+fn load_for_write() -> Result<Settings> {
+    let (settings, origin) = Settings::load_with_origin();
+    if !origin.is_safe_to_overwrite() {
+        bail!(
+            "settings.json exists but could not be read, so writing it would replace \
+             every other setting in it with a default. Fix or remove the file first."
+        );
+    }
+    Ok(settings)
 }
 
 fn normalize_key(key: &str) -> Result<&'static str> {

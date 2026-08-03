@@ -3777,11 +3777,17 @@ fn create_bucket_timezone_fixture_dir() -> TempDir {
 }
 
 fn pin_bucket_timezone(base: &Path, zone: &str) {
+    pin_bucket_timezone_field(base, &format!(r#""{zone}""#));
+}
+
+/// [`pin_bucket_timezone`] with the raw JSON value, so a test can write `null`
+/// as well as a string.
+fn pin_bucket_timezone_field(base: &Path, json_value: &str) {
     let config_dir = base.join(".config/tokscale");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("settings.json"),
-        format!(r#"{{ "scanner": {{ "bucketTimezone": "{zone}" }} }}"#),
+        format!(r#"{{ "scanner": {{ "bucketTimezone": {json_value} }} }}"#),
     )
     .unwrap();
 }
@@ -3945,6 +3951,11 @@ fn test_config_set_timezone_rejects_a_fixed_offset() {
 /// A hand-edited settings.json with a bad zone must not break scanning. It
 /// degrades to the pre-pinning behaviour, which is wrong in the old way rather
 /// than a hard failure on every command.
+///
+/// The run also re-detects a real zone for the field (see
+/// `test_auto_pinning_recovers_from_a_bucket_timezone_that_names_no_zone`), and
+/// the buckets are unchanged either way: auto-pinning only ever records a zone
+/// that reproduces `chrono::Local`, which is what the fallback uses.
 #[test]
 fn test_unparseable_pinned_timezone_falls_back_to_the_host_timezone() {
     let tmp = create_bucket_timezone_fixture_dir();
@@ -3988,5 +3999,139 @@ fn test_first_run_never_rebuckets_when_the_detector_disagrees_with_local() {
         graph_day_buckets(tmp.path(), "XYZ8"),
         vec![("2026-03-02".to_string(), 2)],
         "the recorded zone must reproduce what the first run reported"
+    );
+}
+
+/// Hour keys that actually carry messages, in the order the report emits them.
+fn hourly_keys(base: &Path, timezone: &str) -> Vec<String> {
+    let output = cmd_with_home(base)
+        .env("TZ", timezone)
+        .args(["hourly", "--json", "--client", "opencode", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut keys: Vec<String> = json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["hour"].as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The hourly key embeds a date, and the rebucket pass has already moved every
+/// message's `date` into the pinned zone. Deriving the hour from the host
+/// instead lets one report disagree with itself about which day an hour belongs
+/// to — and a `--today` filter resolved in the pinned zone then selects rows
+/// labelled with the neighbouring host-local date.
+#[test]
+fn test_hourly_keys_follow_the_pinned_bucket_timezone() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone(tmp.path(), "Pacific/Kiritimati");
+
+    // 11:30Z and 18:00Z are 01:30 and 08:00 on 03-03 in Kiritimati (UTC+14),
+    // but 03:30 and 10:00 on 03-02 in Los Angeles — a different day *and* a
+    // different hour, so neither half can match by accident.
+    let expected = vec![
+        "2026-03-03 01:00".to_string(),
+        "2026-03-03 08:00".to_string(),
+    ];
+
+    assert_eq!(
+        hourly_keys(tmp.path(), "America/Los_Angeles"),
+        expected,
+        "hour keys must be built in the pinned zone, not the host's"
+    );
+    assert_eq!(
+        hourly_keys(tmp.path(), "Asia/Seoul"),
+        expected,
+        "and they must not move when the host timezone does"
+    );
+}
+
+/// `Settings::load()` answers an unparseable settings.json with
+/// `Settings::default()`. Auto-pinning is the first path in the CLI that loads
+/// and then unconditionally saves, so on its own it would replace a
+/// hand-edited or truncated settings.json with defaults plus a timezone —
+/// erasing scanner paths, aliases, autosubmit config and UI preferences on a
+/// plain `tokscale graph`, with no prompt and no way back.
+///
+/// The positive control matters: if this host cannot name its own zone the pin
+/// is skipped for every home and the negative cases would pass vacuously.
+#[test]
+fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
+    // Positive control — a readable file on this host really does get pinned.
+    let control = create_bucket_timezone_fixture_dir();
+    let control_settings = control.path().join(".config/tokscale/settings.json");
+    fs::create_dir_all(control_settings.parent().unwrap()).unwrap();
+    fs::write(&control_settings, r#"{"colorPalette":"green"}"#).unwrap();
+    graph_day_buckets(control.path(), "Asia/Seoul");
+    let control_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&control_settings).unwrap()).unwrap();
+    assert!(
+        control_json["scanner"]["bucketTimezone"].is_string(),
+        "auto-pinning must work on this host for the assertions below to mean \
+         anything; got {control_json}"
+    );
+    assert_eq!(
+        control_json["colorPalette"].as_str(),
+        Some("green"),
+        "pinning a readable file must preserve everything else in it"
+    );
+
+    // Truncated JSON, and valid JSON with a field of the wrong type — both make
+    // `serde_json::from_str` fail, and both leave real user data on disk.
+    for unreadable in [
+        r#"{"colorPalette": "green", "scanner": {"#,
+        r#"{"colorPalette": 42, "scanner": {"extraScanPaths": {"claude": ["/data"]}}}"#,
+    ] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        let settings_path = tmp.path().join(".config/tokscale/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, unreadable).unwrap();
+
+        cmd_with_home(tmp.path())
+            .env("TZ", "Asia/Seoul")
+            .args(["graph", "--client", "opencode", "--no-spinner"])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            unreadable,
+            "a settings.json that could not be read must be left byte-identical, \
+             not replaced with defaults plus a timezone"
+        );
+    }
+}
+
+/// `tokscale config` loads and saves too, and it is the one place a user is
+/// watching. Refuse out loud rather than silently replacing a file whose
+/// contents were never recovered.
+#[test]
+fn test_config_set_refuses_to_overwrite_unreadable_settings() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let unreadable = r#"{"scanner": {"extraScanPaths": "not-a-map"}}"#;
+    fs::write(&settings_path, unreadable).unwrap();
+
+    cmd_with_home(tmp.path())
+        .args(["config", "set", "timezone", "Asia/Seoul"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("could not be read"));
+
+    assert_eq!(
+        fs::read_to_string(&settings_path).unwrap(),
+        unreadable,
+        "a refused write must leave the file untouched"
     );
 }
